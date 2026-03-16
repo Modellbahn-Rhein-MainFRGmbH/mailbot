@@ -1,6 +1,6 @@
 """
-Modellbahn-Rhein-Main Mail Assistent v3
-Fabian Rauch - IMAP + Brevo SMTP + Bildanzeige
+Modellbahn-Rhein-Main Mail Assistent v4
+Fabian Rauch - Gmail SMTP + IMAP + Telegram
 """
 
 import imaplib
@@ -20,16 +20,16 @@ from anthropic import Anthropic
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# Mail empfangen (IMAP)
+# Mail empfangen (IMAP - deine echte Mailadresse)
 MAIL_HOST  = os.environ["MAIL_HOST"]
 MAIL_USER  = os.environ["MAIL_USER"]
 MAIL_PASS  = os.environ["MAIL_PASS"]
 
-# Mail senden (Brevo SMTP)
-SMTP_HOST  = os.environ.get("SMTP_HOST", "smtp-relay.brevo.com")
+# Mail senden (Gmail SMTP)
+SMTP_HOST  = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587"))
-BREVO_USER = os.environ.get("BREVO_USER", "")
-BREVO_PASS = os.environ.get("BREVO_PASS", "")
+SMTP_USER  = os.environ.get("SMTP_USER", "")
+SMTP_PASS  = os.environ.get("SMTP_PASS", "")
 
 # Shop APIs
 WC_URL     = os.environ.get("WC_URL", "")
@@ -37,7 +37,6 @@ WC_KEY     = os.environ.get("WC_KEY", "")
 WC_SECRET  = os.environ.get("WC_SECRET", "")
 SC_KEY     = os.environ.get("SC_KEY", "")
 SC_SECRET  = os.environ.get("SC_SECRET", "")
-EBAY_TOKEN = os.environ.get("EBAY_TOKEN", "")
 
 # Telegram
 TG_TOKEN   = os.environ["TG_TOKEN"]
@@ -275,9 +274,9 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
         f"--------------------"
     )
     keyboard = {"inline_keyboard": [
-        [{"text": "✅ Senden",     "callback_data": f"approve:{token}"},
-         {"text": "✏️ Aendern",   "callback_data": f"edit:{token}"}],
-        [{"text": "🗑️ Ignorieren","callback_data": f"ignore:{token}"}]
+        [{"text": "✅ Senden",      "callback_data": f"approve:{token}"},
+         {"text": "✏️ Aendern",    "callback_data": f"edit:{token}"}],
+        [{"text": "🗑️ Ignorieren", "callback_data": f"ignore:{token}"}]
     ]}
     send_telegram_text(msg, keyboard)
     for i, img in enumerate(images):
@@ -286,30 +285,22 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
 
 def send_mail(to_addr, subject, body):
     full_body = body.strip() + "\n\n-- \n" + SIGNATURE
-    api_key   = os.environ.get("BREVO_API_KEY", "")
-    if not api_key:
-        log.error("BREVO_API_KEY fehlt")
-        return False
+    msg       = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = f"Modellbahn-Rhein-Main <{MAIL_USER}>"
+    msg["To"]      = to_addr
+    msg.attach(MIMEText(full_body, "plain", "utf-8"))
     try:
-        r = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
-            headers={"api-key": api_key, "Content-Type": "application/json"},
-            json={
-                "sender":   {"name": "Modellbahn-Rhein-Main", "email": MAIL_USER},
-                "to":       [{"email": to_addr}],
-                "subject":  subject,
-                "textContent": full_body
-            },
-            timeout=15
-        )
-        if r.status_code == 201:
-            log.info(f"Mail gesendet an {to_addr}: {subject}")
-            return True
-        else:
-            log.error(f"Brevo API Fehler: {r.status_code} {r.text}")
-            return False
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        log.info(f"Mail gesendet an {to_addr}: {subject}")
+        return True
     except Exception as e:
-        log.error(f"Brevo API: {e}")
+        log.error(f"SMTP Fehler: {e}")
         return False
 
 
@@ -429,8 +420,8 @@ def handle_telegram_update(update):
 
 
 def main():
-    log.info("Modellbahn-Rhein-Main Mail Assistent v3 gestartet")
-    send_telegram_text("🚂 <b>Modellbahn Mail Assistent v3 gestartet!</b>\nIch ueberwache dein Postfach und eBay.")
+    log.info("Modellbahn-Rhein-Main Mail Assistent v4 gestartet")
+    send_telegram_text("🚂 <b>Modellbahn Mail Assistent v4 gestartet!</b>\nIch ueberwache dein Postfach und eBay.")
     offset     = 0
     mail_timer = 0
     while True:
