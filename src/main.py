@@ -285,23 +285,31 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
 
 
 def send_mail(to_addr, subject, body):
-    full_body  = body.strip() + "\n\n-- \n" + SIGNATURE
-    msg        = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"Modellbahn-Rhein-Main <{MAIL_USER}>"
-    msg["To"]      = to_addr
-    msg.attach(MIMEText(full_body, "plain", "utf-8"))
-    smtp_user  = BREVO_USER if BREVO_USER else MAIL_USER
-    smtp_pass  = BREVO_PASS if BREVO_PASS else MAIL_PASS
+    full_body = body.strip() + "\n\n-- \n" + SIGNATURE
+    api_key   = os.environ.get("BREVO_API_KEY", "")
+    if not api_key:
+        log.error("BREVO_API_KEY fehlt")
+        return False
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(smtp_user, smtp_pass)
-            s.send_message(msg)
-        log.info(f"Mail gesendet an {to_addr}: {subject}")
-        return True
+        r = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={"api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "sender":   {"name": "Modellbahn-Rhein-Main", "email": MAIL_USER},
+                "to":       [{"email": to_addr}],
+                "subject":  subject,
+                "textContent": full_body
+            },
+            timeout=15
+        )
+        if r.status_code == 201:
+            log.info(f"Mail gesendet an {to_addr}: {subject}")
+            return True
+        else:
+            log.error(f"Brevo API Fehler: {r.status_code} {r.text}")
+            return False
     except Exception as e:
-        log.error(f"SMTP Fehler: {e}")
+        log.error(f"Brevo API: {e}")
         return False
 
 
