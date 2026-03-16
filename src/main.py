@@ -21,12 +21,11 @@ from anthropic import Anthropic
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-MAIL_HOST     = os.environ["MAIL_HOST"]
-MAIL_USER     = os.environ["MAIL_USER"]
-MAIL_PASS     = os.environ["MAIL_PASS"]
 SMTP_HOST     = os.environ["SMTP_HOST"]
-SMTP_PORT     = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_SSL      = os.environ.get("SMTP_SSL", "true").lower() == "true"
+SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_SSL      = os.environ.get("SMTP_SSL", "false").lower() == "true"
+BREVO_USER    = os.environ.get("BREVO_USER", "")
+BREVO_PASS    = os.environ.get("BREVO_PASS", "")
 
 WC_URL        = os.environ.get("WC_URL", "")
 WC_KEY        = os.environ.get("WC_KEY", "")
@@ -324,15 +323,12 @@ def send_mail(to_addr, subject, body):
     msg["To"]      = to_addr
     msg.attach(MIMEText(full_body, "plain", "utf-8"))
     try:
-        if SMTP_SSL:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-                s.login(MAIL_USER, MAIL_PASS)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-                s.starttls()
-                s.login(MAIL_USER, MAIL_PASS)
-                s.send_message(msg)
+        smtp_user = BREVO_USER if BREVO_USER else MAIL_USER
+        smtp_pass = BREVO_PASS if BREVO_PASS else MAIL_PASS
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
         log.info(f"Mail gesendet an {to_addr}: {subject}")
         return True
     except Exception as e:
