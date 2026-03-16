@@ -1,6 +1,6 @@
 """
-Modellbahn-Rhein-Main Mail Assistent v2
-Fabian Rauch - mit Bildanzeige, vollstaendiger Kundennachricht, SSL-Fix
+Modellbahn-Rhein-Main Mail Assistent v3
+Fabian Rauch - IMAP + Brevo SMTP + Bildanzeige
 """
 
 import imaplib
@@ -12,7 +12,6 @@ import time
 import logging
 import requests
 import hashlib
-import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
@@ -21,27 +20,33 @@ from anthropic import Anthropic
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-SMTP_HOST     = os.environ["SMTP_HOST"]
-SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_SSL      = os.environ.get("SMTP_SSL", "false").lower() == "true"
-BREVO_USER    = os.environ.get("BREVO_USER", "")
-BREVO_PASS    = os.environ.get("BREVO_PASS", "")
+# Mail empfangen (IMAP)
+MAIL_HOST  = os.environ["MAIL_HOST"]
+MAIL_USER  = os.environ["MAIL_USER"]
+MAIL_PASS  = os.environ["MAIL_PASS"]
 
-WC_URL        = os.environ.get("WC_URL", "")
-WC_KEY        = os.environ.get("WC_KEY", "")
-WC_SECRET     = os.environ.get("WC_SECRET", "")
+# Mail senden (Brevo SMTP)
+SMTP_HOST  = os.environ.get("SMTP_HOST", "smtp-relay.brevo.com")
+SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587"))
+BREVO_USER = os.environ.get("BREVO_USER", "")
+BREVO_PASS = os.environ.get("BREVO_PASS", "")
 
-SC_KEY        = os.environ.get("SC_KEY", "")
-SC_SECRET     = os.environ.get("SC_SECRET", "")
+# Shop APIs
+WC_URL     = os.environ.get("WC_URL", "")
+WC_KEY     = os.environ.get("WC_KEY", "")
+WC_SECRET  = os.environ.get("WC_SECRET", "")
+SC_KEY     = os.environ.get("SC_KEY", "")
+SC_SECRET  = os.environ.get("SC_SECRET", "")
+EBAY_TOKEN = os.environ.get("EBAY_TOKEN", "")
 
-EBAY_TOKEN    = os.environ.get("EBAY_TOKEN", "")
+# Telegram
+TG_TOKEN   = os.environ["TG_TOKEN"]
+TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 
-TG_TOKEN      = os.environ["TG_TOKEN"]
-TG_CHAT_ID    = os.environ["TG_CHAT_ID"]
-
+# Claude
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 
-client = Anthropic(api_key=ANTHROPIC_KEY)
+client  = Anthropic(api_key=ANTHROPIC_KEY)
 pending = {}
 
 SIGNATURE = """Beste Gruesse,
@@ -72,45 +77,31 @@ IDENTITAET UND SPRACHPROFIL:
 - Pragmatisch: Wenn eine Teil-Erstattung schneller ist als Hin-und-Her-Versand, schlag sie direkt vor.
 - Kurze Saetze, klare Aussagen, keine unnoetige Buerokratie.
 - Deutsch fuer deutsche Kunden, Englisch fuer internationale Kunden.
-- Du/Sie je nach Kontext: eBay-Kunden oft du (informell), Shop-Kunden Sie (formell). Orientiere dich an der Ansprache des Kunden.
+- Du/Sie je nach Kontext: eBay-Kunden oft du (informell), Shop-Kunden Sie (formell).
 
 GESCHAEFTSREGELN:
-
-Reklamationen:
-- Artikel unter 15 EUR: Nicht zurueckfordern. Ersatz schicken oder Geld zurueck. Kunde behaelt defektes Teil als Ersatzteilspender.
-- Fehlende/falsche Teile ohne Ersatz: Sofort Wahl anbieten zwischen Teilrueckzahlung oder kompletter Rueckgabe.
-- Ruecksendelabels: NUR bei berechtigten Beschwerden oder technischen Defekten mitsenden. NIEMALS unaufgefordert bei einfacher Stornierung!
-
-Retouren-Links:
+- Artikel unter 15 EUR: Nicht zurueckfordern. Ersatz oder Geld zurueck. Kunde behaelt Teil als Ersatzteilspender.
+- Fehlende/falsche Teile ohne Ersatz: Wahl zwischen Teilrueckzahlung oder Rueckgabe.
+- Ruecksendelabels: NUR bei berechtigten Beschwerden. NIEMALS bei einfacher Stornierung!
 - eBay-Retouren: https://modellbahnrheinmain.shipping-portal.com/rp
 - Shop-Retouren: https://modellbahnrheinmainshop.shipping-portal.com/rp/
-
-Steuern:
-- Bei Tax-Free/MwSt-Erstattungsanfragen: Wir verkaufen nach Paragraph 25a UStG (Differenzbesteuerung fuer Gebrauchtware). Es wird keine MwSt. ausgewiesen, kein Export-Refund moeglich.
-
-Kombiversand:
-- Kunden duerfen 14 Tage lang Auktionen sammeln, bevor Gesamtzahlung faellig wird. Immer bestaetigen.
-
-Technik-Beratung:
-- Fachmaennisch und ehrlich antworten: absolut ruhig, technisch ein Genuss, wie beschrieben.
+- Tax-Free: Wir verkaufen nach Paragraph 25a UStG. Keine MwSt. ausgewiesen, kein Export-Refund.
+- Kombiversand: Kunden duerfen 14 Tage Auktionen sammeln bevor Zahlung faellig wird.
 
 BEISPIEL 1 - Falsche Achsen:
-Kunde: Raeder des Roco FS Personenwagen waren AC statt DC wie beschrieben.
-Antwort: Hallo Karl, vielen Dank fuer deine Nachricht. Es tut mir sehr leid, dass die Achsen des Roco-Wagens faelschlicherweise als DC beschrieben wurden. Leider haben wir aktuell keine passenden Austauschachsen vorraetig. 1. Teilrueckerstattung: Wenn du den Wagen behalten moechtest, erstatte ich dir einen Teil des Kaufpreises zurueck. 2. Rueckgabe: Falls dir der Aufwand zu gross ist, kannst du den Wagen zurueckgeben und erhaeltst den vollen Kaufpreis.
+Antwort: Hallo Karl, es tut mir sehr leid, dass die Achsen falsch beschrieben waren. Leider haben wir aktuell keinen Ersatz. 1. Teilrueckerstattung als Entschaedigung. 2. Rueckgabe gegen vollen Kaufpreis.
 
 BEISPIEL 2 - Technischer Defekt:
-Kunde: BR 212 faehrt nicht mehr nach Reinigung, Decoder nicht ansprechbar.
-Antwort: Sehr geehrter Herr Schmeller, das Pulsieren des Lichts deutet auf einen undefinierten Decoder-Zustand hin. Gerne koennen Sie uns die Lokomotive zur Ueberpruefung zusenden. Bitte legen Sie eine kurze Fehlerbeschreibung sowie Ihre Kontaktdaten bei.
+Antwort: Sehr geehrter Herr Schmeller, das Pulsieren deutet auf einen undefinierten Decoder-Zustand hin. Gerne koennen Sie die Lok zur Ueberpruefung einsenden. Bitte Fehlerbeschreibung und Kontaktdaten beilegen.
 
-BEISPIEL 3 - Verschmutzung und fehlender Puffer:
-Kunde: Wagen sehr verschmutzt, ein Puffer fehlt.
-Antwort: Sehr geehrter Herr Schminke, der fehlende Puffer war bereits in der Artikelbeschreibung erwaehnt. Was die Verschmutzung betrifft, bedaure ich dass uns dies entgangen ist. 1. Sie behalten den Wagen und ich erstatte 5 EUR zurueck. 2. Ruecksendung gegen vollen Kaufpreis.
+BEISPIEL 3 - Verschmutzung:
+Antwort: Sehr geehrter Herr Schminke, die Verschmutzung haette uns auffallen muessen, das tut mir leid. 1. Sie behalten den Wagen, ich erstatte 5 EUR. 2. Ruecksendung gegen vollen Kaufpreis.
 
 FORMAT:
-- Erste Zeile immer: BETREFF: Re: Originalbetreff
+- Erste Zeile: BETREFF: Re: Originalbetreff
 - Dann Leerzeile, dann Mail mit Anrede
-- Unbekannte Werte mit Sternchen markieren: **bitte ergaenzen**
-- Signatur wird automatisch angehaengt
+- Unbekannte Werte markieren: **bitte ergaenzen**
+- Signatur wird automatisch angehaengt, nicht selbst schreiben
 """
 
 
@@ -126,29 +117,22 @@ def decode_str(s):
 
 
 def get_mail_body_and_images(msg):
-    """Extrahiert Text und Bilder aus einer Mail"""
-    body = ""
+    body   = ""
     images = []
-
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
             cd = str(part.get("Content-Disposition", ""))
-
             if ct == "text/plain" and "attachment" not in cd and not body:
                 try:
                     body = part.get_payload(decode=True).decode("utf-8", errors="replace")
                 except:
                     pass
-
             elif ct.startswith("image/") and len(images) < 3:
                 try:
                     img_data = part.get_payload(decode=True)
                     if img_data:
-                        images.append({
-                            "data": img_data,
-                            "type": ct
-                        })
+                        images.append(img_data)
                 except:
                     pass
     else:
@@ -156,7 +140,6 @@ def get_mail_body_and_images(msg):
             body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
         except:
             body = ""
-
     return body, images
 
 
@@ -166,9 +149,9 @@ def classify_mail(subject, body):
         max_tokens=20,
         messages=[{"role": "user", "content": (
             "Klassifiziere diese E-Mail fuer einen Modellbahn-Haendler.\n"
-            "Antworte NUR mit einem Wort: 'question' oder 'ignore'.\n"
+            "Antworte NUR mit: 'question' oder 'ignore'.\n"
             "question = Kundenfrage (Lieferstatus, Retoure, Beschaedigung, Produktfrage, Beschwerde)\n"
-            "ignore = Rechnung, Newsletter, automatische Benachrichtigung, Spam\n\n"
+            "ignore = Rechnung, Newsletter, Spam, automatische Benachrichtigung\n\n"
             f"Betreff: {subject}\nInhalt: {body[:400]}"
         )}]
     )
@@ -187,7 +170,7 @@ def fetch_woocommerce_order(sender_email):
         )
         orders = r.json()
         if orders and isinstance(orders, list):
-            o = orders[0]
+            o     = orders[0]
             items = ", ".join(f"{i['name']} (x{i['quantity']})" for i in o.get("line_items", []))
             return {"order_id": o.get("id"), "status": o.get("status"),
                     "total": o.get("total"), "date": o.get("date_created", "")[:10], "items": items}
@@ -250,41 +233,32 @@ def generate_draft(subject, body, sender, channel, order_context):
 
 
 def send_telegram_text(text, reply_markup=None):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    url     = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        return r.json()
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        log.error(f"Telegram Text: {e}")
+        log.error(f"Telegram: {e}")
 
 
 def send_telegram_photo(image_data, caption=""):
-    """Sendet ein Bild direkt an Telegram"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     try:
-        files = {"photo": ("image.jpg", image_data, "image/jpeg")}
-        data = {"chat_id": TG_CHAT_ID, "caption": caption}
-        r = requests.post(url, files=files, data=data, timeout=15)
-        return r.json()
+        requests.post(url, files={"photo": ("image.jpg", image_data, "image/jpeg")},
+                      data={"chat_id": TG_CHAT_ID, "caption": caption}, timeout=15)
     except Exception as e:
         log.error(f"Telegram Foto: {e}")
 
 
 def send_approval_request(token, sender, subject, body, draft, channel, order_context, images):
-    lines = draft.split("\n")
-    mail_body = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
-    kanal = "🏪 eBay" if channel == "ebay" else "🛒 Shop"
-
-    # Kundennachricht kuerzen fuer Anzeige
-    body_preview = body.strip()[:600]
-    if len(body.strip()) > 600:
-        body_preview += "..."
-
-    context_short = order_context[:250] + ("..." if len(order_context) > 250 else "")
-    draft_preview = mail_body[:600] + ("..." if len(mail_body) > 600 else "")
+    lines        = draft.split("\n")
+    mail_body    = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
+    kanal        = "🏪 eBay" if channel == "ebay" else "🛒 Shop"
+    body_preview = body.strip()[:500] + ("..." if len(body.strip()) > 500 else "")
+    ctx_short    = order_context[:200] + ("..." if len(order_context) > 200 else "")
+    draft_prev   = mail_body[:500] + ("..." if len(mail_body) > 500 else "")
 
     msg = (
         f"{kanal} <b>Neue Kundenanfrage</b>\n"
@@ -294,37 +268,32 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
         f"--------------------\n"
         f"{body_preview}\n"
         f"--------------------\n\n"
-        f"<b>Bestelldaten:</b>\n<code>{context_short}</code>\n\n"
+        f"<b>Bestelldaten:</b>\n<code>{ctx_short}</code>\n\n"
         f"<b>Mein Vorschlag:</b>\n"
         f"--------------------\n"
-        f"{draft_preview}\n"
+        f"{draft_prev}\n"
         f"--------------------"
     )
-
     keyboard = {"inline_keyboard": [
-        [{"text": "✅ Senden", "callback_data": f"approve:{token}"},
-         {"text": "✏️ Aendern", "callback_data": f"edit:{token}"}],
-        [{"text": "🗑️ Ignorieren", "callback_data": f"ignore:{token}"}]
+        [{"text": "✅ Senden",     "callback_data": f"approve:{token}"},
+         {"text": "✏️ Aendern",   "callback_data": f"edit:{token}"}],
+        [{"text": "🗑️ Ignorieren","callback_data": f"ignore:{token}"}]
     ]}
     send_telegram_text(msg, keyboard)
-
-    # Bilder senden falls vorhanden
-    if images:
-        for i, img in enumerate(images):
-            caption = f"📷 Bild {i+1} von {len(images)} aus der Kunden-Mail"
-            send_telegram_photo(img["data"], caption)
+    for i, img in enumerate(images):
+        send_telegram_photo(img, f"📷 Bild {i+1} von {len(images)}")
 
 
 def send_mail(to_addr, subject, body):
-    full_body = body.strip() + "\n\n-- \n" + SIGNATURE
-    msg = MIMEMultipart("alternative")
+    full_body  = body.strip() + "\n\n-- \n" + SIGNATURE
+    msg        = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = MAIL_USER
+    msg["From"]    = f"Modellbahn-Rhein-Main <{MAIL_USER}>"
     msg["To"]      = to_addr
     msg.attach(MIMEText(full_body, "plain", "utf-8"))
+    smtp_user  = BREVO_USER if BREVO_USER else MAIL_USER
+    smtp_pass  = BREVO_PASS if BREVO_PASS else MAIL_PASS
     try:
-        smtp_user = BREVO_USER if BREVO_USER else MAIL_USER
-        smtp_pass = BREVO_PASS if BREVO_PASS else MAIL_PASS
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
             s.starttls()
             s.login(smtp_user, smtp_pass)
@@ -351,8 +320,8 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
     pending[token] = {
         "sender": sender_email, "subject": subject, "body": body,
         "draft": draft, "channel": channel,
-        "ebay_thread_id": ebay_thread_id, "order_context": context,
-        "images": images or []
+        "ebay_thread_id": ebay_thread_id,
+        "order_context": context, "images": images or []
     }
     send_approval_request(token, sender_email, subject, body, draft, channel, context, images or [])
     log.info(f"Entwurf gesendet fuer {sender_email} (Token: {token})")
@@ -364,7 +333,7 @@ def check_inbox():
             imap.login(MAIL_USER, MAIL_PASS)
             imap.select("INBOX")
             _, data = imap.search(None, "UNSEEN")
-            ids = data[0].split()
+            ids     = data[0].split()
             log.info(f"{len(ids)} ungelesene Mail(s)")
             for mid in ids:
                 _, msg_data = imap.fetch(mid, "(RFC822)")
@@ -398,18 +367,16 @@ def handle_telegram_update(update):
             send_telegram_text("⚠️ Vorgang nicht mehr gefunden.")
             return
         p = pending[token]
-
         if action == "approve":
             lines = p["draft"].split("\n")
             subj  = next((l.replace("BETREFF:", "").strip() for l in lines if l.startswith("BETREFF:")), f"Re: {p['subject']}")
             body  = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
-            ok = send_mail(p["sender"], subj, body)
+            ok    = send_mail(p["sender"], subj, body)
             del pending[token]
             if ok:
-                send_telegram_text(f"✅ Mail an <code>{p['sender']}</code> wurde gesendet!")
+                send_telegram_text(f"✅ Mail an <code>{p['sender']}</code> gesendet!")
             else:
-                send_telegram_text(f"⚠️ Fehler beim Senden! Bitte manuell antworten an {p['sender']}")
-
+                send_telegram_text(f"⚠️ Fehler! Bitte manuell antworten an {p['sender']}")
         elif action == "edit":
             pending[token]["awaiting_edit"] = True
             send_telegram_text(
@@ -421,7 +388,6 @@ def handle_telegram_update(update):
                 f"- Auf Englisch schreiben\n\n"
                 f"Token: <code>{token}</code>"
             )
-
         elif action == "ignore":
             del pending[token]
             send_telegram_text("🗑️ Vorgang ignoriert.")
@@ -445,7 +411,7 @@ def handle_telegram_update(update):
                     ]
                 )
                 new_draft = resp.content[0].text.strip()
-                pending[token]["draft"]        = new_draft
+                pending[token]["draft"]         = new_draft
                 pending[token]["awaiting_edit"] = False
                 send_approval_request(
                     token, p["sender"], p["subject"], p["body"],
@@ -455,8 +421,8 @@ def handle_telegram_update(update):
 
 
 def main():
-    log.info("Modellbahn-Rhein-Main Mail Assistent v2 gestartet")
-    send_telegram_text("🚂 <b>Modellbahn Mail Assistent gestartet!</b>\nIch ueberwache dein Postfach und eBay.")
+    log.info("Modellbahn-Rhein-Main Mail Assistent v3 gestartet")
+    send_telegram_text("🚂 <b>Modellbahn Mail Assistent v3 gestartet!</b>\nIch ueberwache dein Postfach und eBay.")
     offset     = 0
     mail_timer = 0
     while True:
