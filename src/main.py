@@ -34,6 +34,10 @@ WC_SECRET  = os.environ.get("WC_SECRET", "")
 SC_KEY     = os.environ.get("SC_KEY", "")
 SC_SECRET  = os.environ.get("SC_SECRET", "")
 
+# WordPress Application Password (fuer Rechnungs-PDF Download)
+WP_USER     = os.environ.get("WP_USER", "")
+WP_APP_PASS = os.environ.get("WP_APP_PASS", "")
+
 # Telegram
 TG_TOKEN   = os.environ["TG_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
@@ -100,22 +104,22 @@ def build_feedback_prompt():
     return "\n".join(lines)
 
 
-SIGNATURE = """Beste Gruesse,
+SIGNATURE = """Beste Grüße,
 
 Fabian Rauch
-Geschaeftsfuehrer
+Geschäftsführer
 Modellbahn-Rhein-Main FR GmbH
 
 Tel: 0160 3833340
 E-Mail: info@modellbahn-rhein-main.de
 Web: www.modellbahn-rhein-main.de
-Adresse: Max-Planck-Str. 18, 63322 Roedrmark
+Adresse: Max-Planck-Str. 18, 63322 Rödermark
 
 Handelsregister: Amtsgericht Offenbach, HRB 58191
-Umsatzsteuer-ID gemass 27a UStG: DE456540670
+Umsatzsteuer-ID gemäß 27a UStG: DE456540670
 
-Hinweis: Diese E-Mail enthaelt vertrauliche Informationen. Wenn Sie nicht der
-beabsichtigte Empfaenger sind, informieren Sie bitte den Absender und loeschen
+Hinweis: Diese E-Mail enthält vertrauliche Informationen. Wenn Sie nicht der
+beabsichtigte Empfänger sind, informieren Sie bitte den Absender und löschen
 Sie die Nachricht."""
 
 SYSTEM_PROMPT = """
@@ -484,8 +488,42 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
         send_telegram_photo(img, f"📷 Bild {i+1} von {len(images)}")
 
 
-def send_mail(to_addr, subject, body):
-    """Mail senden ueber Brevo HTTP API (kein SMTP, kein Port-Problem auf Railway)"""
+def fetch_invoice_pdf(order_id):
+    """Rechnungs-PDF von WordPress/German Market herunterladen."""
+    if not WP_USER or not WP_APP_PASS or not order_id:
+        return None
+    try:
+        import base64
+        # WordPress Application Password Auth
+        credentials = base64.b64encode(f"{WP_USER}:{WP_APP_PASS}".encode()).decode()
+
+        # Zuerst brauchen wir einen gueltigen Nonce
+        # Wir nutzen den wp-admin AJAX Endpoint mit Basic Auth
+        session = requests.Session()
+        session.headers.update({"Authorization": f"Basic {credentials}"})
+
+        # Direkt den Invoice-Download Endpoint aufrufen
+        r = session.get(
+            f"{WC_URL}/wp-admin/admin-ajax.php",
+            params={
+                "action": "woocommerce_wp_wc_invoice_pdf_invoice_download",
+                "order_id": str(order_id)
+            },
+            timeout=30
+        )
+        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("application/pdf"):
+            log.info(f"Rechnungs-PDF heruntergeladen fuer Bestellung #{order_id} ({len(r.content)} Bytes)")
+            return r.content
+        else:
+            log.warning(f"Rechnungs-PDF nicht verfuegbar fuer #{order_id} (Status: {r.status_code})")
+    except Exception as e:
+        log.warning(f"Rechnungs-PDF Fehler: {e}")
+    return None
+
+
+def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
+    """Mail senden ueber Brevo HTTP API, optional mit PDF-Anhang."""
+    import base64
     full_body = body.strip() + "\n\n-- \n" + SIGNATURE
     payload = {
         "sender": {"name": "Modellbahn-Rhein-Main", "email": MAIL_USER},
@@ -494,6 +532,16 @@ def send_mail(to_addr, subject, body):
         "textContent": full_body,
         "replyTo": {"email": MAIL_USER}
     }
+
+    # PDF-Anhang hinzufuegen falls vorhanden
+    if pdf_attachment and pdf_filename:
+        pdf_b64 = base64.b64encode(pdf_attachment).decode()
+        payload["attachment"] = [{
+            "content": pdf_b64,
+            "name": pdf_filename
+        }]
+        log.info(f"PDF-Anhang: {pdf_filename} ({len(pdf_attachment)} Bytes)")
+
     headers = {
         "api-key": BREVO_API_KEY,
         "Content-Type": "application/json",
@@ -538,6 +586,7 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
         "sender": sender_email, "subject": subject, "body": body,
         "draft": draft, "channel": channel, "category": category,
         "ebay_thread_id": ebay_thread_id,
+        "order_id": order_data.get("order_id") if order_data else None,
         "order_context": context, "images": images or []
     }
     send_approval_request(token, sender_email, subject, body, draft, channel, context, images or [], category)
@@ -608,8 +657,23 @@ def handle_telegram_update(update):
                 ok = ebay_send_reply(p["ebay_thread_id"], body)
                 channel_label = "eBay"
             else:
-                ok = send_mail(p["sender"], subj, body)
-                channel_label = "Mail"
+                # Bei Rechnungsanfragen: PDF automatisch anhaengen
+                pdf_data = None
+                pdf_name = None
+                order_id = p.get("order_id")
+                category = p.get("category", "")
+
+                if category == "rechnung_steuer" and order_id:
+                    send_telegram_text(f"📄 Lade Rechnungs-PDF für Bestellung #{order_id}...")
+                    pdf_data = fetch_invoice_pdf(order_id)
+                    if pdf_data:
+                        pdf_name = f"Rechnung_{order_id}.pdf"
+                        send_telegram_text(f"✅ Rechnung gefunden, wird angehängt!")
+                    else:
+                        send_telegram_text(f"⚠️ Keine Rechnung für #{order_id} gefunden. Mail wird ohne Anhang gesendet.")
+
+                ok = send_mail(p["sender"], subj, body, pdf_attachment=pdf_data, pdf_filename=pdf_name)
+                channel_label = "Mail" + (" + Rechnung" if pdf_data else "")
 
             del pending[token]
             if ok:
