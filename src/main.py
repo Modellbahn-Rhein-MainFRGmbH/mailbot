@@ -234,6 +234,8 @@ Bei STORNIERUNG:
 Bei RECHNUNG_STEUER:
 - Immer auf Paragraph 25a UStG Differenzbesteuerung hinweisen.
 - Keine MwSt. ausweisbar, kein Export-Refund moeglich.
+- Wenn Kunde eine Rechnung anfordert: Einfach bestaetigen dass die Rechnung per Mail zugesendet wird.
+- WICHTIG: NIEMALS schreiben "[Rechnung als PDF-Anhang beifuegen]" oder aehnliche Platzhalter! Die Rechnung wird AUTOMATISCH vom System als PDF angehaengt. Im Text einfach schreiben: "Die Rechnung zu Ihrer Bestellung finden Sie im Anhang dieser E-Mail."
 
 Bei KOMBIVERSAND:
 - 14 Tage Sammelzeit bestaetigen.
