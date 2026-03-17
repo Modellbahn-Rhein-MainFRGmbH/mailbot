@@ -182,6 +182,12 @@ Bei RABATTANFRAGE:
 - Hoeflich aber bestimmt: Kaum Rabatte moeglich.
 - Hoechstens bei laenger eingestellten Artikeln.
 
+Bei KONTAKTFORMULAR:
+- Kunde hat ueber das Website-Formular geschrieben.
+- Anrede: Sie (formell), da es ein Shop-Kunde ist.
+- Inhalt der Nachricht sorgfaeltig lesen und passend antworten.
+- Falls eine Artikelnummer genannt wird: Verfuegbarkeit bestaetigen falls in Bestelldaten sichtbar.
+
 BEISPIEL 1 - Falsche Achsen:
 Antwort: Hallo Karl, es tut mir sehr leid, dass die Achsen falsch beschrieben waren. Leider haben wir aktuell keinen Ersatz. 1. Teilrueckerstattung als Entschaedigung. 2. Rueckgabe gegen vollen Kaufpreis.
 
@@ -211,8 +217,9 @@ def decode_str(s):
 
 
 def get_mail_body_and_images(msg):
-    body   = ""
-    images = []
+    body      = ""
+    html_body = ""
+    images    = []
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
@@ -220,6 +227,11 @@ def get_mail_body_and_images(msg):
             if ct == "text/plain" and "attachment" not in cd and not body:
                 try:
                     body = part.get_payload(decode=True).decode("utf-8", errors="replace")
+                except:
+                    pass
+            elif ct == "text/html" and "attachment" not in cd and not html_body:
+                try:
+                    html_body = part.get_payload(decode=True).decode("utf-8", errors="replace")
                 except:
                     pass
             elif ct.startswith("image/") and len(images) < 3:
@@ -230,11 +242,45 @@ def get_mail_body_and_images(msg):
                 except:
                     pass
     else:
+        ct = msg.get_content_type()
         try:
-            body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+            raw = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+            if ct == "text/html":
+                html_body = raw
+            else:
+                body = raw
         except:
             body = ""
+
+    # Fallback: Wenn kein Plain-Text, HTML in lesbaren Text umwandeln
+    if not body.strip() and html_body:
+        body = html_to_text(html_body)
+        log.info("Kein Plain-Text, HTML-Body verwendet")
+
     return body, images
+
+
+def html_to_text(html):
+    """Einfache HTML-zu-Text Konvertierung ohne externe Libraries."""
+    import re
+    # Script und Style Bloecke entfernen
+    text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # <br> und <p> in Zeilenumbrueche
+    text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</div>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</tr>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</td>', ' | ', text, flags=re.IGNORECASE)
+    text = re.sub(r'</th>', ' | ', text, flags=re.IGNORECASE)
+    # Alle HTML-Tags entfernen
+    text = re.sub(r'<[^>]+>', '', text)
+    # HTML-Entities
+    text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    text = text.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&#39;', "'")
+    # Mehrfache Leerzeilen reduzieren
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    return text.strip()
 
 
 # ============================================================
@@ -250,7 +296,8 @@ CATEGORIES = [
     "rechnung_steuer",   # Rechnung, MwSt., Tax-Free
     "kombiversand",      # Sammelbestellung, 14-Tage-Regel
     "rabattanfrage",     # Preisnachlass, Mengenrabatt
-    "ignore"             # Newsletter, Spam, automatische Mails, Rechnungen
+    "kontaktformular",   # Anfrage ueber Website-Kontaktformular
+    "ignore"             # Newsletter, Spam, automatische Mails OHNE Kundenfrage
 ]
 
 def classify_mail(subject, body):
@@ -269,7 +316,10 @@ def classify_mail(subject, body):
             "rechnung_steuer = Rechnung, MwSt., Tax-Free Anfrage\n"
             "kombiversand = Sammelbestellung, 14-Tage-Regel\n"
             "rabattanfrage = Preisnachlass, Mengenrabatt\n"
-            "ignore = Newsletter, Spam, automatische Benachrichtigung, System-Mail\n\n"
+            "kontaktformular = Anfrage ueber Website-Kontaktformular (Betreff enthaelt 'Kontakt', 'Neuer Eintrag', 'Formular')\n"
+            "ignore = NUR Newsletter, Spam, rein automatische System-Mails OHNE Kundenfrage\n\n"
+            "WICHTIG: Wenn eine Mail eine Kundenfrage enthaelt (egal ob per Formular oder direkt), ist es NIEMALS ignore!\n"
+            "Mails mit Betreff 'Neuer Eintrag: Kontakt' sind Kontaktformular-Anfragen, NICHT ignore.\n\n"
             f"Betreff: {subject}\nInhalt: {body[:500]}"
         )}]
     )
@@ -284,8 +334,95 @@ def classify_mail(subject, body):
 # VERBESSERTER WOOCOMMERCE-ABRUF: Hoehere Timeouts, mehr Daten, Retry
 # ============================================================
 
+def extract_order_number(subject, body):
+    """Bestellnummer aus Betreff oder Mailtext extrahieren."""
+    import re
+    text = f"{subject} {body}"
+    # Typische Muster: #1540592, Bestellnummer 1540592, Bestellung 1540592, Order 1540592
+    patterns = [
+        r'#\s*(\d{4,})',                           # #1540592
+        r'[Bb]estell(?:ung|nummer)[:\s#]*(\d{4,})', # Bestellnummer 1540592, Bestellung 1540592
+        r'[Oo]rder[:\s#]*(\d{4,})',                 # Order 1540592
+        r'[Aa]uftrag[:\s#]*(\d{4,})',               # Auftrag 1540592
+        r'(?:Nr|Nummer)[.:\s]*(\d{4,})',            # Nr. 1540592
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def fetch_order_by_id(order_id):
+    """Eine spezifische Bestellung direkt per ID abrufen."""
+    if not WC_KEY or not order_id:
+        return None
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                f"{WC_URL}/wp-json/wc/v3/orders/{order_id}",
+                auth=(WC_KEY, WC_SECRET),
+                timeout=30
+            )
+            if r.status_code == 200:
+                return parse_order_data(r.json(), order_count=1)
+            elif r.status_code == 404:
+                log.info(f"Bestellung #{order_id} nicht gefunden")
+                return None
+            else:
+                log.warning(f"WooCommerce Order #{order_id}: Status {r.status_code}")
+        except requests.exceptions.Timeout:
+            log.warning(f"WooCommerce Timeout fuer #{order_id} (Versuch {attempt + 1}/2)")
+            if attempt == 0:
+                time.sleep(3)
+                continue
+        except Exception as e:
+            log.warning(f"WooCommerce: {e}")
+            break
+    return None
+
+
+def parse_order_data(o, order_count=1):
+    """Order-JSON in unser internes Format umwandeln."""
+    items = ", ".join(
+        f"{i['name']} (x{i['quantity']}, {i.get('total', '?')} EUR)"
+        for i in o.get("line_items", [])
+    )
+    shipping = o.get("shipping", {})
+    ship_addr = f"{shipping.get('city', '')}, {shipping.get('country', '')}" if shipping else ""
+    customer_note = o.get("customer_note", "")
+    payment = o.get("payment_method_title", "")
+
+    status_map = {
+        "processing": "In Bearbeitung",
+        "completed": "Abgeschlossen",
+        "on-hold": "Wartend",
+        "pending": "Ausstehend",
+        "cancelled": "Storniert",
+        "refunded": "Erstattet",
+        "failed": "Fehlgeschlagen"
+    }
+    status = status_map.get(o.get("status", ""), o.get("status", ""))
+
+    result = {
+        "order_id": o.get("id"),
+        "status": status,
+        "total": o.get("total"),
+        "date": o.get("date_created", "")[:10],
+        "items": items,
+        "shipping_city": ship_addr,
+        "payment_method": payment,
+        "customer_note": customer_note,
+        "order_count": order_count
+    }
+    coupons = o.get("coupon_lines", [])
+    if coupons:
+        result["coupons"] = ", ".join(c.get("code", "") for c in coupons)
+    return result
+
+
 def fetch_woocommerce_order(sender_email):
-    """WooCommerce-Bestellungen abrufen mit Retry und mehr Details."""
+    """WooCommerce-Bestellungen per E-Mail suchen (Fallback wenn keine Bestellnummer)."""
     if not WC_KEY:
         return None
 
@@ -295,61 +432,16 @@ def fetch_woocommerce_order(sender_email):
                 f"{WC_URL}/wp-json/wc/v3/orders",
                 auth=(WC_KEY, WC_SECRET),
                 params={"search": sender_email, "per_page": 3, "orderby": "date", "order": "desc"},
-                timeout=30  # Erhoeht von 10 auf 30 Sekunden
+                timeout=30
             )
             orders = r.json()
             if orders and isinstance(orders, list):
-                o = orders[0]
-                items = ", ".join(
-                    f"{i['name']} (x{i['quantity']}, {i.get('total', '?')} EUR)"
-                    for i in o.get("line_items", [])
-                )
-
-                # Versandadresse fuer Kontext
-                shipping = o.get("shipping", {})
-                ship_addr = f"{shipping.get('city', '')}, {shipping.get('country', '')}" if shipping else ""
-
-                # Kundennotizen
-                customer_note = o.get("customer_note", "")
-
-                # Zahlungsmethode
-                payment = o.get("payment_method_title", "")
-
-                # Bestellstatus lesbar machen
-                status_map = {
-                    "processing": "In Bearbeitung",
-                    "completed": "Abgeschlossen",
-                    "on-hold": "Wartend",
-                    "pending": "Ausstehend",
-                    "cancelled": "Storniert",
-                    "refunded": "Erstattet",
-                    "failed": "Fehlgeschlagen"
-                }
-                status = status_map.get(o.get("status", ""), o.get("status", ""))
-
-                result = {
-                    "order_id": o.get("id"),
-                    "status": status,
-                    "total": o.get("total"),
-                    "date": o.get("date_created", "")[:10],
-                    "items": items,
-                    "shipping_city": ship_addr,
-                    "payment_method": payment,
-                    "customer_note": customer_note,
-                    "order_count": len(orders)  # Wie viele Bestellungen hat der Kunde
-                }
-
-                # Coupon-Codes falls vorhanden
-                coupons = o.get("coupon_lines", [])
-                if coupons:
-                    result["coupons"] = ", ".join(c.get("code", "") for c in coupons)
-
-                return result
+                return parse_order_data(orders[0], order_count=len(orders))
 
         except requests.exceptions.Timeout:
             log.warning(f"WooCommerce Timeout (Versuch {attempt + 1}/2)")
             if attempt == 0:
-                time.sleep(3)  # 3 Sekunden warten, dann nochmal
+                time.sleep(3)
                 continue
         except Exception as e:
             log.warning(f"WooCommerce: {e}")
@@ -456,7 +548,7 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
     cat_emoji = {
         "lieferstatus": "📦", "retoure": "↩️", "beschwerde": "⚠️",
         "produktfrage": "❓", "stornierung": "❌", "rechnung_steuer": "🧾",
-        "kombiversand": "📮", "rabattanfrage": "💰"
+        "kombiversand": "📮", "rabattanfrage": "💰", "kontaktformular": "📋"
     }
     cat_icon = cat_emoji.get(category, "📧")
 
@@ -524,6 +616,10 @@ def fetch_invoice_pdf(order_id):
 def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
     """Mail senden ueber Brevo HTTP API, optional mit PDF-Anhang."""
     import base64
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.application import MIMEApplication
+
     full_body = body.strip() + "\n\n-- \n" + SIGNATURE
     payload = {
         "sender": {"name": "Modellbahn-Rhein-Main", "email": MAIL_USER},
@@ -556,6 +652,10 @@ def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
         )
         if r.status_code in (200, 201):
             log.info(f"Mail gesendet an {to_addr}: {subject}")
+
+            # Kopie in Gesendet-Ordner ablegen
+            save_to_sent_folder(to_addr, subject, full_body, pdf_attachment, pdf_filename)
+
             return True
         else:
             log.error(f"Brevo Fehler {r.status_code}: {r.text}")
@@ -563,6 +663,70 @@ def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
     except Exception as e:
         log.error(f"Brevo Fehler: {e}")
         return False
+
+
+def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_filename=None):
+    """Gesendete Mail per IMAP im Gesendet-Ordner ablegen."""
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.application import MIMEApplication
+    from email.utils import formatdate
+
+    try:
+        # E-Mail zusammenbauen
+        if pdf_attachment and pdf_filename:
+            msg = MIMEMultipart()
+            msg.attach(MIMEText(full_body, "plain", "utf-8"))
+            pdf_part = MIMEApplication(pdf_attachment, _subtype="pdf")
+            pdf_part.add_header("Content-Disposition", "attachment", filename=pdf_filename)
+            msg.attach(pdf_part)
+        else:
+            msg = MIMEText(full_body, "plain", "utf-8")
+
+        msg["Subject"] = subject
+        msg["From"]    = f"Modellbahn-Rhein-Main <{MAIL_USER}>"
+        msg["To"]      = to_addr
+        msg["Date"]    = formatdate(localtime=True)
+
+        # Per IMAP in Gesendet-Ordner ablegen
+        with imaplib.IMAP4_SSL(MAIL_HOST) as imap:
+            imap.login(MAIL_USER, MAIL_PASS)
+
+            # Gaengige Namen fuer den Gesendet-Ordner probieren
+            sent_folders = ["Sent", "INBOX.Sent", "Gesendet", "INBOX.Gesendet",
+                           "Sent Messages", "Sent Items", "INBOX.Sent Messages"]
+            sent_folder = None
+
+            # Ordnerliste vom Server holen
+            _, folder_list = imap.list()
+            available = []
+            for f in folder_list:
+                if f:
+                    decoded = f.decode() if isinstance(f, bytes) else f
+                    available.append(decoded)
+
+            for folder in sent_folders:
+                try:
+                    status, _ = imap.select(f'"{folder}"')
+                    if status == "OK":
+                        sent_folder = folder
+                        break
+                except:
+                    continue
+
+            if sent_folder:
+                imap.append(
+                    f'"{sent_folder}"',
+                    "\\Seen",
+                    imaplib.Time2Internaldate(time.time()),
+                    msg.as_bytes()
+                )
+                log.info(f"Mail in '{sent_folder}' abgelegt fuer {to_addr}")
+            else:
+                log.warning(f"Gesendet-Ordner nicht gefunden. Verfuegbar: {available[:5]}")
+
+    except Exception as e:
+        log.warning(f"Gesendet-Ordner: {e} (Mail wurde trotzdem gesendet)")
 
 
 def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None):
@@ -578,10 +742,21 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
 
     log.info(f"Kategorie: {category} | {subject}")
     sender_email = sender.split("<")[-1].replace(">", "").strip()
-    order_data   = fetch_woocommerce_order(sender_email)
-    tracking     = fetch_sendcloud_tracking(order_data)
-    context      = build_context(sender_email, order_data, tracking)
-    draft        = generate_draft(subject, body, sender, channel, context, category)
+
+    # Schritt 1: Bestellnummer aus der Mail extrahieren und direkt suchen
+    order_number = extract_order_number(subject, body)
+    order_data = None
+    if order_number:
+        log.info(f"Bestellnummer aus Mail extrahiert: #{order_number}")
+        order_data = fetch_order_by_id(order_number)
+
+    # Schritt 2: Fallback - nach E-Mail-Adresse suchen
+    if not order_data:
+        order_data = fetch_woocommerce_order(sender_email)
+
+    tracking = fetch_sendcloud_tracking(order_data)
+    context  = build_context(sender_email, order_data, tracking)
+    draft    = generate_draft(subject, body, sender, channel, context, category)
     pending[token] = {
         "sender": sender_email, "subject": subject, "body": body,
         "draft": draft, "channel": channel, "category": category,
