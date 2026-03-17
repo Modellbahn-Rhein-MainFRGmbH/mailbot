@@ -144,6 +144,15 @@ GESCHAEFTSREGELN:
 - Kombiversand: Kunden duerfen 14 Tage Auktionen sammeln bevor Zahlung faellig wird.
 - Rabatte: Kaum Rabatte, hoechstens bei schon laenger eingestellten Artikeln.
 
+WICHTIG - LAGER UND SORTIMENT:
+- Wir verkaufen ausschliesslich gebrauchte Modellbahn-Ware (Sammlerstuecke, Gebrauchtware).
+- JEDER Artikel ist ein Unikat mit Lagerbestand 1. Wenn ausverkauft, dann wirklich weg.
+- Nachbestellen ist NICHT moeglich. Wir kaufen Sammlungen auf - ob ein Artikel wiederkommt, ist Zufall.
+- Wenn ein Artikel als "Ausverkauft" angezeigt wird: Dem Kunden ehrlich sagen, dass der Artikel leider schon verkauft wurde und wir ihn nicht nachbestellen koennen.
+- NIEMALS sagen "Wir bestellen nach" oder "Wir koennen den Artikel fuer Sie reservieren/bestellen".
+- Stattdessen: "Schauen Sie gerne regelmaessig in unseren Shop, es kommen immer wieder neue Schaetze dazu."
+- Wenn ein Artikel "Auf Lager" ist: Schnell zugreifen empfehlen, da jeder Artikel nur einmal vorhanden ist.
+
 KATEGORIE-SPEZIFISCHE ANWEISUNGEN:
 
 Bei LIEFERSTATUS:
@@ -163,6 +172,9 @@ Bei BESCHWERDE:
 
 Bei PRODUKTFRAGE:
 - Fachkundig antworten mit Modellbahn-Wissen.
+- Artikelnummer (SKU) wird automatisch nachgeschlagen. Nutze die ARTIKEL-INFORMATIONEN aus den Bestelldaten.
+- Wenn Artikel "Auf Lager": Verfuegbarkeit bestaetigen, Preis nennen, ggf. Shop-Link mitgeben. Hinweis: Unikat, schnell zugreifen.
+- Wenn Artikel "Ausverkauft": Ehrlich sagen, dass er leider schon verkauft wurde. NICHT "nachbestellen" anbieten.
 - Wenn du die Antwort nicht weisst: Ehrlich sagen und Rueckruf/Mail anbieten.
 
 Bei STORNIERUNG:
@@ -186,7 +198,8 @@ Bei KONTAKTFORMULAR:
 - Kunde hat ueber das Website-Formular geschrieben.
 - Anrede: Sie (formell), da es ein Shop-Kunde ist.
 - Inhalt der Nachricht sorgfaeltig lesen und passend antworten.
-- Falls eine Artikelnummer genannt wird: Verfuegbarkeit bestaetigen falls in Bestelldaten sichtbar.
+- Falls eine Artikelnummer genannt wird: Nutze die ARTIKEL-INFORMATIONEN um Verfuegbarkeit und Preis zu nennen.
+- Beachte: Jeder Artikel ist ein Unikat. "Auf Lager" = sofort bestellbar. "Ausverkauft" = leider weg.
 
 BEISPIEL 1 - Falsche Achsen:
 Antwort: Hallo Karl, es tut mir sehr leid, dass die Achsen falsch beschrieben waren. Leider haben wir aktuell keinen Ersatz. 1. Teilrueckerstattung als Entschaedigung. 2. Rueckgabe gegen vollen Kaufpreis.
@@ -353,6 +366,65 @@ def extract_order_number(subject, body):
     return None
 
 
+def extract_sku_codes(subject, body):
+    """Artikelnummern (SKUs) aus Betreff oder Mailtext extrahieren.
+    Format: Buchstaben + Zahlen ohne Leerzeichen, z.B. KAD0007, SRT37, JB051"""
+    import re
+    text = f"{subject} {body}"
+    # SKU-Muster: 2-5 Buchstaben gefolgt von 1-6 Ziffern (z.B. KAD0007, SRT37, JB051, THE407)
+    matches = re.findall(r'\b([A-Za-z]{2,5}\d{1,6})\b', text)
+    # Duplikate entfernen, Reihenfolge beibehalten
+    seen = set()
+    skus = []
+    for m in matches:
+        upper = m.upper()
+        if upper not in seen:
+            seen.add(upper)
+            skus.append(upper)
+    # Typische Nicht-SKUs herausfiltern
+    ignore = {"HTML", "HTTP", "HTTPS", "UTF8", "EUR", "USD", "IMAP", "SMTP", "PDF", "CSS", "API"}
+    skus = [s for s in skus if s not in ignore]
+    return skus[:5]  # Maximal 5 SKUs
+
+
+def fetch_product_by_sku(sku):
+    """Produkt ueber Artikelnummer (SKU) aus WooCommerce abrufen."""
+    if not WC_KEY or not sku:
+        return None
+    try:
+        r = requests.get(
+            f"{WC_URL}/wp-json/wc/v3/products",
+            auth=(WC_KEY, WC_SECRET),
+            params={"sku": sku, "per_page": 1},
+            timeout=30
+        )
+        products = r.json()
+        if products and isinstance(products, list) and len(products) > 0:
+            p = products[0]
+            stock_status_map = {
+                "instock": "Auf Lager",
+                "outofstock": "Ausverkauft",
+                "onbackorder": "Auf Nachbestellung"
+            }
+            result = {
+                "sku": p.get("sku", sku),
+                "name": p.get("name", ""),
+                "price": p.get("price", ""),
+                "regular_price": p.get("regular_price", ""),
+                "stock_status": stock_status_map.get(p.get("stock_status", ""), p.get("stock_status", "")),
+                "stock_quantity": p.get("stock_quantity"),
+                "permalink": p.get("permalink", ""),
+                "short_description": p.get("short_description", "")[:100]
+            }
+            log.info(f"Produkt gefunden: {sku} = {result['name']} ({result['stock_status']}, {result['price']} EUR)")
+            return result
+        else:
+            log.info(f"Kein Produkt gefunden fuer SKU: {sku}")
+    except Exception as e:
+        log.warning(f"WooCommerce Produkt {sku}: {e}")
+    return None
+
+
 def fetch_order_by_id(order_id):
     """Eine spezifische Bestellung direkt per ID abrufen."""
     if not WC_KEY or not order_id:
@@ -472,7 +544,7 @@ def fetch_sendcloud_tracking(order_data):
     return None
 
 
-def build_context(sender_email, order_data, tracking_data):
+def build_context(sender_email, order_data, tracking_data, product_data=None):
     lines = []
     if order_data:
         lines.append(f"Bestellung #{order_data['order_id']}: {order_data['items']}")
@@ -492,6 +564,15 @@ def build_context(sender_email, order_data, tracking_data):
         lines.append(f"Paketstatus: {tracking_data['status']}")
         if tracking_data.get("tracking_url"):
             lines.append(f"Tracking: {tracking_data['tracking_url']}")
+    if product_data:
+        lines.append("\nARTIKEL-INFORMATIONEN:")
+        for prod in product_data:
+            lines.append(f"  Artikelnr: {prod['sku']} | {prod['name']}")
+            lines.append(f"  Preis: {prod['price']} EUR | Verfuegbarkeit: {prod['stock_status']}")
+            if prod.get("stock_quantity") is not None:
+                lines.append(f"  Lagerbestand: {prod['stock_quantity']} Stueck")
+            if prod.get("permalink"):
+                lines.append(f"  Shop-Link: {prod['permalink']}")
     return "\n".join(lines) if lines else "Keine Bestelldaten gefunden."
 
 
@@ -754,8 +835,18 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
     if not order_data:
         order_data = fetch_woocommerce_order(sender_email)
 
+    # Schritt 3: Artikelnummern (SKUs) aus der Mail extrahieren und Produkte nachschlagen
+    skus = extract_sku_codes(subject, body)
+    product_data = []
+    if skus:
+        log.info(f"Artikelnummern aus Mail extrahiert: {skus}")
+        for sku in skus:
+            prod = fetch_product_by_sku(sku)
+            if prod:
+                product_data.append(prod)
+
     tracking = fetch_sendcloud_tracking(order_data)
-    context  = build_context(sender_email, order_data, tracking)
+    context  = build_context(sender_email, order_data, tracking, product_data)
     draft    = generate_draft(subject, body, sender, channel, context, category)
     pending[token] = {
         "sender": sender_email, "subject": subject, "body": body,
