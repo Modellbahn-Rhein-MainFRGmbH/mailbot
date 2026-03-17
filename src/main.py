@@ -1,6 +1,7 @@
 """
-Modellbahn-Rhein-Main Mail Assistent v4
-Fabian Rauch - Gmail SMTP + IMAP + Telegram
+Modellbahn-Rhein-Main Mail Assistent v5
+Fabian Rauch - Brevo API + IMAP + Telegram
+Neu: Feedback-Loop, bessere Kategorien, robuster WooCommerce-Abruf
 """
 
 import imaplib
@@ -11,6 +12,7 @@ import time
 import logging
 import requests
 import hashlib
+from datetime import datetime
 from email.header import decode_header
 from anthropic import Anthropic
 
@@ -39,8 +41,64 @@ TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 # Claude
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 
+# Feedback-Datei (Railway Volume oder lokaler Pfad)
+FEEDBACK_DIR  = os.environ.get("FEEDBACK_DIR", "/data")
+FEEDBACK_FILE = os.path.join(FEEDBACK_DIR, "feedback_history.json")
+
 client  = Anthropic(api_key=ANTHROPIC_KEY)
 pending = {}
+
+
+# ============================================================
+# FEEDBACK-LOOP: Korrekturen speichern und beim Prompten nutzen
+# ============================================================
+
+def load_feedback():
+    """Lade bisherige Korrekturen aus JSON-Datei."""
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+        if os.path.exists(FEEDBACK_FILE):
+            with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"Feedback laden: {e}")
+    return []
+
+
+def save_feedback(entry):
+    """Speichere eine Korrektur (Original + Aenderung + Kontext)."""
+    try:
+        history = load_feedback()
+        history.append(entry)
+        # Maximal 50 Korrekturen behalten (die neuesten)
+        if len(history) > 50:
+            history = history[-50:]
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+        with open(FEEDBACK_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        log.info(f"Feedback gespeichert ({len(history)} Eintraege)")
+    except Exception as e:
+        log.warning(f"Feedback speichern: {e}")
+
+
+def build_feedback_prompt():
+    """Erstelle einen Prompt-Abschnitt aus den letzten Korrekturen."""
+    history = load_feedback()
+    if not history:
+        return ""
+    # Die letzten 10 Korrekturen als Lernbeispiele
+    recent = history[-10:]
+    lines = ["\nLERNBEISPIELE AUS BISHERIGEN KORREKTUREN (Fabians echte Aenderungen):"]
+    for i, fb in enumerate(recent, 1):
+        lines.append(f"\nKorrektur {i}:")
+        lines.append(f"  Kategorie: {fb.get('category', 'unbekannt')}")
+        lines.append(f"  Kundenanfrage: {fb.get('customer_query', '')[:100]}")
+        lines.append(f"  Mein Vorschlag war: {fb.get('original_draft', '')[:150]}")
+        lines.append(f"  Fabian wollte: {fb.get('edit_instruction', '')}")
+        lines.append(f"  Korrigierte Version: {fb.get('corrected_draft', '')[:150]}")
+    lines.append("\nNutze diese Korrekturen um Fabians Stil und Vorlieben besser zu treffen.")
+    return "\n".join(lines)
+
 
 SIGNATURE = """Beste Gruesse,
 
@@ -80,6 +138,45 @@ GESCHAEFTSREGELN:
 - Shop-Retouren: https://modellbahnrheinmainshop.shipping-portal.com/rp/
 - Tax-Free: Wir verkaufen nach Paragraph 25a UStG. Keine MwSt. ausgewiesen, kein Export-Refund.
 - Kombiversand: Kunden duerfen 14 Tage Auktionen sammeln bevor Zahlung faellig wird.
+- Rabatte: Kaum Rabatte, hoechstens bei schon laenger eingestellten Artikeln.
+
+KATEGORIE-SPEZIFISCHE ANWEISUNGEN:
+
+Bei LIEFERSTATUS:
+- Nutze die Sendcloud-Tracking-Daten falls vorhanden.
+- Gib dem Kunden die Trackingnummer und den aktuellen Status.
+- Wenn kein Tracking vorhanden: Bestelldatum pruefen, Bearbeitungszeit erwaehnen (1-3 Werktage).
+
+Bei RETOURE:
+- Unterscheide: eBay oder Shop? Jeweils anderen Retourenlink senden.
+- Frag nach dem Grund. Bei Widerruf kein Ruecksendelabel.
+- Bei berechtigter Beschwerde: Ruecksendelabel anbieten.
+
+Bei BESCHWERDE:
+- Erst Verstaendnis zeigen, dann Loesung anbieten.
+- Unter 15 EUR: Sofort Geld zurueck oder Ersatz, Artikel behalten.
+- Ueber 15 EUR: Optionen anbieten (Teilerstattung oder Rueckgabe).
+
+Bei PRODUKTFRAGE:
+- Fachkundig antworten mit Modellbahn-Wissen.
+- Wenn du die Antwort nicht weisst: Ehrlich sagen und Rueckruf/Mail anbieten.
+
+Bei STORNIERUNG:
+- Pruefen ob Bestellung schon versendet wurde (Sendcloud-Daten).
+- Wenn schon versendet: Kunde informieren, Retoure anbieten.
+- Wenn noch nicht versendet: Stornierung bestaetigen.
+
+Bei RECHNUNG_STEUER:
+- Immer auf Paragraph 25a UStG Differenzbesteuerung hinweisen.
+- Keine MwSt. ausweisbar, kein Export-Refund moeglich.
+
+Bei KOMBIVERSAND:
+- 14 Tage Sammelzeit bestaetigen.
+- Erklaeren wie der Ablauf funktioniert.
+
+Bei RABATTANFRAGE:
+- Hoeflich aber bestimmt: Kaum Rabatte moeglich.
+- Hoechstens bei laenger eingestellten Artikeln.
 
 BEISPIEL 1 - Falsche Achsen:
 Antwort: Hallo Karl, es tut mir sehr leid, dass die Achsen falsch beschrieben waren. Leider haben wir aktuell keinen Ersatz. 1. Teilrueckerstattung als Entschaedigung. 2. Rueckgabe gegen vollen Kaufpreis.
@@ -136,39 +233,124 @@ def get_mail_body_and_images(msg):
     return body, images
 
 
+# ============================================================
+# VERBESSERTE KLASSIFIZIERUNG: Feine Kategorien statt nur question/ignore
+# ============================================================
+
+CATEGORIES = [
+    "lieferstatus",      # Wo ist mein Paket? Versandbestaetigung?
+    "retoure",           # Rueckgabe, Widerruf, Umtausch
+    "beschwerde",        # Defekt, Beschaedigung, falscher Artikel, Verschmutzung
+    "produktfrage",      # Technische Fragen, Verfuegbarkeit, Kompatibilitaet
+    "stornierung",       # Bestellung stornieren
+    "rechnung_steuer",   # Rechnung, MwSt., Tax-Free
+    "kombiversand",      # Sammelbestellung, 14-Tage-Regel
+    "rabattanfrage",     # Preisnachlass, Mengenrabatt
+    "ignore"             # Newsletter, Spam, automatische Mails, Rechnungen
+]
+
 def classify_mail(subject, body):
+    """Klassifiziere Mail in feine Kategorien fuer bessere Antworten."""
     resp = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=20,
+        max_tokens=30,
         messages=[{"role": "user", "content": (
             "Klassifiziere diese E-Mail fuer einen Modellbahn-Haendler.\n"
-            "Antworte NUR mit: 'question' oder 'ignore'.\n"
-            "question = Kundenfrage (Lieferstatus, Retoure, Beschaedigung, Produktfrage, Beschwerde)\n"
-            "ignore = Rechnung, Newsletter, Spam, automatische Benachrichtigung\n\n"
-            f"Betreff: {subject}\nInhalt: {body[:400]}"
+            "Antworte NUR mit einer der folgenden Kategorien:\n"
+            "lieferstatus = Wo ist mein Paket, Versandbestaetigung\n"
+            "retoure = Rueckgabe, Widerruf, Umtausch\n"
+            "beschwerde = Defekt, Beschaedigung, falscher Artikel, Verschmutzung\n"
+            "produktfrage = Technische Frage, Verfuegbarkeit, Kompatibilitaet\n"
+            "stornierung = Bestellung stornieren\n"
+            "rechnung_steuer = Rechnung, MwSt., Tax-Free Anfrage\n"
+            "kombiversand = Sammelbestellung, 14-Tage-Regel\n"
+            "rabattanfrage = Preisnachlass, Mengenrabatt\n"
+            "ignore = Newsletter, Spam, automatische Benachrichtigung, System-Mail\n\n"
+            f"Betreff: {subject}\nInhalt: {body[:500]}"
         )}]
     )
-    return "question" if "question" in resp.content[0].text.lower() else "ignore"
+    result = resp.content[0].text.strip().lower()
+    for cat in CATEGORIES:
+        if cat in result:
+            return cat
+    return "ignore"
 
+
+# ============================================================
+# VERBESSERTER WOOCOMMERCE-ABRUF: Hoehere Timeouts, mehr Daten, Retry
+# ============================================================
 
 def fetch_woocommerce_order(sender_email):
+    """WooCommerce-Bestellungen abrufen mit Retry und mehr Details."""
     if not WC_KEY:
         return None
-    try:
-        r = requests.get(
-            f"{WC_URL}/wp-json/wc/v3/orders",
-            auth=(WC_KEY, WC_SECRET),
-            params={"search": sender_email, "per_page": 1},
-            timeout=10
-        )
-        orders = r.json()
-        if orders and isinstance(orders, list):
-            o     = orders[0]
-            items = ", ".join(f"{i['name']} (x{i['quantity']})" for i in o.get("line_items", []))
-            return {"order_id": o.get("id"), "status": o.get("status"),
-                    "total": o.get("total"), "date": o.get("date_created", "")[:10], "items": items}
-    except Exception as e:
-        log.warning(f"WooCommerce: {e}")
+
+    for attempt in range(2):  # 2 Versuche
+        try:
+            r = requests.get(
+                f"{WC_URL}/wp-json/wc/v3/orders",
+                auth=(WC_KEY, WC_SECRET),
+                params={"search": sender_email, "per_page": 3, "orderby": "date", "order": "desc"},
+                timeout=30  # Erhoeht von 10 auf 30 Sekunden
+            )
+            orders = r.json()
+            if orders and isinstance(orders, list):
+                o = orders[0]
+                items = ", ".join(
+                    f"{i['name']} (x{i['quantity']}, {i.get('total', '?')} EUR)"
+                    for i in o.get("line_items", [])
+                )
+
+                # Versandadresse fuer Kontext
+                shipping = o.get("shipping", {})
+                ship_addr = f"{shipping.get('city', '')}, {shipping.get('country', '')}" if shipping else ""
+
+                # Kundennotizen
+                customer_note = o.get("customer_note", "")
+
+                # Zahlungsmethode
+                payment = o.get("payment_method_title", "")
+
+                # Bestellstatus lesbar machen
+                status_map = {
+                    "processing": "In Bearbeitung",
+                    "completed": "Abgeschlossen",
+                    "on-hold": "Wartend",
+                    "pending": "Ausstehend",
+                    "cancelled": "Storniert",
+                    "refunded": "Erstattet",
+                    "failed": "Fehlgeschlagen"
+                }
+                status = status_map.get(o.get("status", ""), o.get("status", ""))
+
+                result = {
+                    "order_id": o.get("id"),
+                    "status": status,
+                    "total": o.get("total"),
+                    "date": o.get("date_created", "")[:10],
+                    "items": items,
+                    "shipping_city": ship_addr,
+                    "payment_method": payment,
+                    "customer_note": customer_note,
+                    "order_count": len(orders)  # Wie viele Bestellungen hat der Kunde
+                }
+
+                # Coupon-Codes falls vorhanden
+                coupons = o.get("coupon_lines", [])
+                if coupons:
+                    result["coupons"] = ", ".join(c.get("code", "") for c in coupons)
+
+                return result
+
+        except requests.exceptions.Timeout:
+            log.warning(f"WooCommerce Timeout (Versuch {attempt + 1}/2)")
+            if attempt == 0:
+                time.sleep(3)  # 3 Sekunden warten, dann nochmal
+                continue
+        except Exception as e:
+            log.warning(f"WooCommerce: {e}")
+            break
+
     return None
 
 
@@ -180,7 +362,7 @@ def fetch_sendcloud_tracking(order_data):
             "https://panel.sendcloud.sc/api/v2/parcels",
             auth=(SC_KEY, SC_SECRET),
             params={"search": str(order_data.get("order_id", ""))},
-            timeout=10
+            timeout=15  # Erhoeht von 10 auf 15
         )
         parcels = r.json().get("parcels", [])
         if parcels:
@@ -199,6 +381,16 @@ def build_context(sender_email, order_data, tracking_data):
     if order_data:
         lines.append(f"Bestellung #{order_data['order_id']}: {order_data['items']}")
         lines.append(f"Status: {order_data['status']} | Datum: {order_data['date']} | Betrag: {order_data['total']} EUR")
+        if order_data.get("payment_method"):
+            lines.append(f"Bezahlung: {order_data['payment_method']}")
+        if order_data.get("shipping_city"):
+            lines.append(f"Versand nach: {order_data['shipping_city']}")
+        if order_data.get("customer_note"):
+            lines.append(f"Kundennotiz: {order_data['customer_note']}")
+        if order_data.get("order_count", 0) > 1:
+            lines.append(f"Stammkunde: {order_data['order_count']} Bestellungen gefunden")
+        if order_data.get("coupons"):
+            lines.append(f"Gutscheine: {order_data['coupons']}")
     if tracking_data:
         lines.append(f"Sendung: {tracking_data['carrier']} {tracking_data['tracking_number']}")
         lines.append(f"Paketstatus: {tracking_data['status']}")
@@ -207,19 +399,25 @@ def build_context(sender_email, order_data, tracking_data):
     return "\n".join(lines) if lines else "Keine Bestelldaten gefunden."
 
 
-def generate_draft(subject, body, sender, channel, order_context):
+def generate_draft(subject, body, sender, channel, context, category):
+    """Antwort generieren mit Kategorie und Feedback-Kontext."""
     channel_hint = "eBay-Nachricht" if channel == "ebay" else "Shop-Mail"
+    feedback_section = build_feedback_prompt()
+    full_system = SYSTEM_PROMPT + feedback_section
+
     resp = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
-        system=SYSTEM_PROMPT,
+        system=full_system,
         messages=[{"role": "user", "content": (
             f"Kanal: {channel_hint}\n"
+            f"Kategorie: {category}\n"
             f"Absender: {sender}\n"
             f"Betreff: {subject}\n\n"
-            f"BESTELLDATEN:\n{order_context}\n\n"
+            f"BESTELLDATEN:\n{context}\n\n"
             f"KUNDEN-NACHRICHT:\n{body}\n\n"
-            f"Erstelle die fertige Antwort. Erste Zeile: BETREFF: Re: {subject}"
+            f"Erstelle die fertige Antwort. Beachte die kategorie-spezifischen Anweisungen fuer '{category}'.\n"
+            f"Erste Zeile: BETREFF: Re: {subject}"
         )}]
     )
     return resp.content[0].text.strip()
@@ -245,16 +443,25 @@ def send_telegram_photo(image_data, caption=""):
         log.error(f"Telegram Foto: {e}")
 
 
-def send_approval_request(token, sender, subject, body, draft, channel, order_context, images):
+def send_approval_request(token, sender, subject, body, draft, channel, order_context, images, category):
     lines        = draft.split("\n")
     mail_body    = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
     kanal        = "🏪 eBay" if channel == "ebay" else "🛒 Shop"
+
+    # Kategorie-Emoji fuer Telegram
+    cat_emoji = {
+        "lieferstatus": "📦", "retoure": "↩️", "beschwerde": "⚠️",
+        "produktfrage": "❓", "stornierung": "❌", "rechnung_steuer": "🧾",
+        "kombiversand": "📮", "rabattanfrage": "💰"
+    }
+    cat_icon = cat_emoji.get(category, "📧")
+
     body_preview = body.strip()[:500] + ("..." if len(body.strip()) > 500 else "")
-    ctx_short    = order_context[:200] + ("..." if len(order_context) > 200 else "")
+    ctx_short    = order_context[:300] + ("..." if len(order_context) > 300 else "")
     draft_prev   = mail_body[:500] + ("..." if len(mail_body) > 500 else "")
 
     msg = (
-        f"{kanal} <b>Neue Kundenanfrage</b>\n"
+        f"{kanal} {cat_icon} <b>{category.upper()}</b>\n"
         f"Von: <code>{sender}</code>\n"
         f"Betreff: {subject}\n\n"
         f"<b>Kunden-Nachricht:</b>\n"
@@ -314,22 +521,35 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
     token = hashlib.md5(f"{sender}{subject}{body[:50]}".encode()).hexdigest()[:8]
     if token in pending:
         return
-    if classify_mail(subject, body) == "ignore":
+
+    # Verfeinerte Klassifizierung
+    category = classify_mail(subject, body)
+    if category == "ignore":
         log.info(f"Ignoriert: {subject}")
         return
+
+    log.info(f"Kategorie: {category} | {subject}")
     sender_email = sender.split("<")[-1].replace(">", "").strip()
     order_data   = fetch_woocommerce_order(sender_email)
     tracking     = fetch_sendcloud_tracking(order_data)
     context      = build_context(sender_email, order_data, tracking)
-    draft        = generate_draft(subject, body, sender, channel, context)
+    draft        = generate_draft(subject, body, sender, channel, context, category)
     pending[token] = {
         "sender": sender_email, "subject": subject, "body": body,
-        "draft": draft, "channel": channel,
+        "draft": draft, "channel": channel, "category": category,
         "ebay_thread_id": ebay_thread_id,
         "order_context": context, "images": images or []
     }
-    send_approval_request(token, sender_email, subject, body, draft, channel, context, images or [])
-    log.info(f"Entwurf gesendet fuer {sender_email} (Token: {token})")
+    send_approval_request(token, sender_email, subject, body, draft, channel, context, images or [], category)
+    log.info(f"Entwurf gesendet fuer {sender_email} (Token: {token}, Kategorie: {category})")
+
+
+def is_ebay_notification(sender):
+    """Pruefe ob die Mail eine eBay-Benachrichtigung ist (ignorieren)."""
+    sender_lower = sender.lower()
+    ebay_domains = ["@members.ebay.de", "@members.ebay.com", "@ebay.de", "@ebay.com",
+                    "@reply.ebay.de", "@reply.ebay.com"]
+    return any(domain in sender_lower for domain in ebay_domains)
 
 
 def check_inbox():
@@ -345,6 +565,12 @@ def check_inbox():
                 msg     = email_lib.message_from_bytes(msg_data[0][1])
                 subject = decode_str(msg.get("Subject", ""))
                 sender  = msg.get("From", "")
+
+                # eBay-Mails ignorieren (werden ueber eBay API abgerufen)
+                if is_ebay_notification(sender):
+                    log.info(f"eBay-Mail ignoriert: {subject}")
+                    continue
+
                 body, images = get_mail_body_and_images(msg)
                 process_mail(subject, sender, body, channel="shop", images=images)
     except Exception as e:
@@ -376,10 +602,18 @@ def handle_telegram_update(update):
             lines = p["draft"].split("\n")
             subj  = next((l.replace("BETREFF:", "").strip() for l in lines if l.startswith("BETREFF:")), f"Re: {p['subject']}")
             body  = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
-            ok    = send_mail(p["sender"], subj, body)
+
+            # eBay-Nachrichten ueber eBay API beantworten, Shop-Mails per Brevo
+            if p.get("channel") == "ebay" and p.get("ebay_thread_id") and EBAY_ENABLED:
+                ok = ebay_send_reply(p["ebay_thread_id"], body)
+                channel_label = "eBay"
+            else:
+                ok = send_mail(p["sender"], subj, body)
+                channel_label = "Mail"
+
             del pending[token]
             if ok:
-                send_telegram_text(f"✅ Mail an <code>{p['sender']}</code> gesendet!")
+                send_telegram_text(f"✅ {channel_label} an <code>{p['sender']}</code> gesendet!")
             else:
                 send_telegram_text(f"⚠️ Fehler! Bitte manuell antworten an {p['sender']}")
         elif action == "edit":
@@ -405,10 +639,15 @@ def handle_telegram_update(update):
             if p.get("awaiting_edit"):
                 lines    = p["draft"].split("\n")
                 old_body = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
+
+                # Feedback-Kontext auch beim Aendern nutzen
+                feedback_section = build_feedback_prompt()
+                full_system = SYSTEM_PROMPT + feedback_section
+
                 resp = client.messages.create(
                     model="claude-sonnet-4-20250514",
                     max_tokens=1000,
-                    system=SYSTEM_PROMPT,
+                    system=full_system,
                     messages=[
                         {"role": "user",      "content": f"Bisheriger Entwurf:\n\n{old_body}"},
                         {"role": "assistant", "content": old_body},
@@ -416,20 +655,158 @@ def handle_telegram_update(update):
                     ]
                 )
                 new_draft = resp.content[0].text.strip()
+
+                # === FEEDBACK-LOOP: Korrektur speichern ===
+                save_feedback({
+                    "timestamp": datetime.now().isoformat(),
+                    "category": p.get("category", "unbekannt"),
+                    "customer_query": p.get("body", "")[:200],
+                    "original_draft": old_body[:300],
+                    "edit_instruction": text,
+                    "corrected_draft": new_draft[:300]
+                })
+
                 pending[token]["draft"]         = new_draft
                 pending[token]["awaiting_edit"] = False
                 send_approval_request(
                     token, p["sender"], p["subject"], p["body"],
-                    new_draft, p["channel"], p["order_context"], p["images"]
+                    new_draft, p["channel"], p["order_context"], p["images"],
+                    p.get("category", "unbekannt")
                 )
                 break
 
 
+# ============================================================
+# eBAY API: Nachrichten direkt aus dem eBay-Portal abrufen
+# Aktivieren sobald Developer Account freigeschaltet ist
+# ============================================================
+
+EBAY_CLIENT_ID     = os.environ.get("EBAY_CLIENT_ID", "")
+EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
+EBAY_REFRESH_TOKEN = os.environ.get("EBAY_REFRESH_TOKEN", "")
+EBAY_ENABLED       = bool(EBAY_CLIENT_ID and EBAY_CLIENT_SECRET and EBAY_REFRESH_TOKEN)
+
+
+def ebay_get_access_token():
+    """Hole einen neuen Access Token ueber den Refresh Token."""
+    if not EBAY_ENABLED:
+        return None
+    try:
+        import base64
+        credentials = base64.b64encode(f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()).decode()
+        r = requests.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {credentials}"
+            },
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": EBAY_REFRESH_TOKEN,
+                "scope": "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.fulfillment"
+            },
+            timeout=15
+        )
+        if r.status_code == 200:
+            token = r.json().get("access_token")
+            log.info("eBay Access Token erneuert")
+            return token
+        else:
+            log.error(f"eBay Token Fehler {r.status_code}: {r.text}")
+    except Exception as e:
+        log.error(f"eBay Token: {e}")
+    return None
+
+
+def ebay_check_messages():
+    """Pruefe eBay-Nachrichten ueber die Post-Order API."""
+    if not EBAY_ENABLED:
+        return
+    token = ebay_get_access_token()
+    if not token:
+        return
+    try:
+        # eBay Member Messages abrufen (letzte 24h, unbeantwortet)
+        r = requests.get(
+            "https://api.ebay.com/post-order/v2/inquiry/search",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-EBAY-C-MARKETPLACE-ID": "EBAY_DE"
+            },
+            params={"status": "OPEN", "limit": 10},
+            timeout=20
+        )
+        if r.status_code == 200:
+            inquiries = r.json().get("members", [])
+            for inq in inquiries:
+                msg_id  = inq.get("inquiryId", "")
+                buyer   = inq.get("buyer", {}).get("username", "unbekannt")
+                subject = inq.get("subject", "eBay Anfrage")
+                body    = inq.get("description", "")
+                item    = inq.get("itemId", "")
+
+                if body:
+                    full_subject = f"[eBay] {subject} (Artikel: {item})"
+                    process_mail(
+                        full_subject, buyer, body,
+                        channel="ebay", ebay_thread_id=msg_id
+                    )
+            log.info(f"eBay: {len(inquiries)} offene Anfragen geprueft")
+        else:
+            log.warning(f"eBay Messages {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"eBay Messages: {e}")
+
+
+def ebay_send_reply(inquiry_id, message_text):
+    """Antwort ueber eBay zurueckschicken (nicht per Mail)."""
+    if not EBAY_ENABLED:
+        return False
+    token = ebay_get_access_token()
+    if not token:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.ebay.com/post-order/v2/inquiry/{inquiry_id}/send_message",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-EBAY-C-MARKETPLACE-ID": "EBAY_DE"
+            },
+            json={"message": message_text},
+            timeout=15
+        )
+        if r.status_code in (200, 201, 204):
+            log.info(f"eBay Antwort gesendet (Inquiry: {inquiry_id})")
+            return True
+        else:
+            log.error(f"eBay Antwort Fehler {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.error(f"eBay Antwort: {e}")
+    return False
+
+
 def main():
-    log.info("Modellbahn-Rhein-Main Mail Assistent v4 gestartet")
-    send_telegram_text("🚂 <b>Modellbahn Mail Assistent v4 gestartet!</b>\nIch ueberwache dein Postfach und eBay.")
+    log.info("Modellbahn-Rhein-Main Mail Assistent v5 gestartet")
+
+    # Feedback-Status anzeigen
+    fb_count = len(load_feedback())
+    fb_info = f"\n📊 {fb_count} Korrekturen im Lernarchiv" if fb_count > 0 else ""
+    ebay_info = "✅ eBay API aktiv" if EBAY_ENABLED else "⏳ eBay API noch nicht konfiguriert"
+
+    send_telegram_text(
+        f"🚂 <b>Modellbahn Mail Assistent v5 gestartet!</b>\n"
+        f"Ich ueberwache dein Postfach und eBay.\n\n"
+        f"<b>Neu in v5:</b>\n"
+        f"📂 Feine Kategorien (Lieferstatus, Retoure, Beschwerde, ...)\n"
+        f"🧠 Lerne aus deinen Korrekturen\n"
+        f"📦 Bessere Bestelldaten aus WooCommerce\n"
+        f"🏪 {ebay_info}{fb_info}"
+    )
     offset     = 0
     mail_timer = 0
+    ebay_timer = 0
     while True:
         updates = get_telegram_updates(offset)
         for upd in updates:
@@ -438,6 +815,10 @@ def main():
         if time.time() - mail_timer > 120:
             check_inbox()
             mail_timer = time.time()
+        # eBay alle 3 Minuten pruefen (wenn API aktiv)
+        if EBAY_ENABLED and time.time() - ebay_timer > 180:
+            ebay_check_messages()
+            ebay_timer = time.time()
         time.sleep(2)
 
 
