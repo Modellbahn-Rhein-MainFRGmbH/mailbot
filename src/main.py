@@ -4,7 +4,6 @@ Fabian Rauch - Gmail SMTP + IMAP + Telegram
 """
 
 import imaplib
-import smtplib
 import email as email_lib
 import os
 import json
@@ -12,8 +11,6 @@ import time
 import logging
 import requests
 import hashlib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
 from anthropic import Anthropic
 
@@ -25,11 +22,8 @@ MAIL_HOST  = os.environ["MAIL_HOST"]
 MAIL_USER  = os.environ["MAIL_USER"]
 MAIL_PASS  = os.environ["MAIL_PASS"]
 
-# Mail senden (Gmail SMTP)
-SMTP_HOST  = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT  = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER  = os.environ.get("SMTP_USER", "")
-SMTP_PASS  = os.environ.get("SMTP_PASS", "")
+# Mail senden (Brevo HTTP API - kein SMTP noetig!)
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 
 # Shop APIs
 WC_URL     = os.environ.get("WC_URL", "")
@@ -284,23 +278,35 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
 
 
 def send_mail(to_addr, subject, body):
+    """Mail senden ueber Brevo HTTP API (kein SMTP, kein Port-Problem auf Railway)"""
     full_body = body.strip() + "\n\n-- \n" + SIGNATURE
-    msg       = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"Modellbahn-Rhein-Main <{MAIL_USER}>"
-    msg["To"]      = to_addr
-    msg.attach(MIMEText(full_body, "plain", "utf-8"))
+    payload = {
+        "sender": {"name": "Modellbahn-Rhein-Main", "email": MAIL_USER},
+        "to": [{"email": to_addr}],
+        "subject": subject,
+        "textContent": full_body,
+        "replyTo": {"email": MAIL_USER}
+    }
+    headers = {
+        "api-key": BREVO_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-        log.info(f"Mail gesendet an {to_addr}: {subject}")
-        return True
+        r = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+        if r.status_code in (200, 201):
+            log.info(f"Mail gesendet an {to_addr}: {subject}")
+            return True
+        else:
+            log.error(f"Brevo Fehler {r.status_code}: {r.text}")
+            return False
     except Exception as e:
-        log.error(f"SMTP Fehler: {e}")
+        log.error(f"Brevo Fehler: {e}")
         return False
 
 
