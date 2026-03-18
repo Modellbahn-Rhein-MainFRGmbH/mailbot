@@ -465,6 +465,42 @@ def extract_order_number(subject, body):
     return None
 
 
+def extract_invoice_number(subject, body):
+    """Rechnungsnummer aus Betreff oder Mailtext extrahieren."""
+    import re
+    text = f"{subject} {body}"
+    patterns = [
+        r'[Rr]echnung(?:snummer)?[:\s#]*(\d{4,})',   # Rechnung 20261814, Rechnungsnummer 20261814
+        r'[Ii]nvoice[:\s#]*(\d{4,})',                  # Invoice 20261814
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def find_order_by_invoice_number(invoice_number):
+    """Bestellung ueber Rechnungsnummer in WooCommerce finden."""
+    if not WC_KEY or not invoice_number:
+        return None
+    try:
+        # WooCommerce durchsuchen - Rechnungsnummer ist oft in den Meta-Daten
+        r = requests.get(
+            f"{WC_URL}/wp-json/wc/v3/orders",
+            auth=(WC_KEY, WC_SECRET),
+            params={"search": invoice_number, "per_page": 3},
+            timeout=30
+        )
+        orders = r.json()
+        if orders and isinstance(orders, list):
+            log.info(f"Bestellung ueber Rechnungsnummer {invoice_number} gefunden: #{orders[0].get('id')}")
+            return parse_order_data(orders[0], order_count=len(orders))
+    except Exception as e:
+        log.warning(f"WooCommerce Rechnungssuche: {e}")
+    return None
+
+
 def extract_sku_codes(subject, body):
     """Artikelnummern (SKUs) aus Betreff oder Mailtext extrahieren.
     Format: Buchstaben + Zahlen ohne Leerzeichen, z.B. KAD0007, SRT37, JB051"""
@@ -621,25 +657,42 @@ def fetch_woocommerce_order(sender_email):
     return None
 
 
-def fetch_sendcloud_tracking(order_data):
-    if not SC_KEY or not order_data:
+def fetch_sendcloud_tracking(order_data, extra_search=None):
+    """Sendcloud Tracking abrufen. Sucht nach order_id, oder extra_search als Fallback."""
+    if not SC_KEY:
         return None
-    try:
-        r = requests.get(
-            "https://panel.sendcloud.sc/api/v2/parcels",
-            auth=(SC_KEY, SC_SECRET),
-            params={"search": str(order_data.get("order_id", ""))},
-            timeout=15  # Erhoeht von 10 auf 15
-        )
-        parcels = r.json().get("parcels", [])
-        if parcels:
-            p = parcels[0]
-            return {"tracking_number": p.get("tracking_number"),
+
+    search_terms = []
+    if order_data and order_data.get("order_id"):
+        search_terms.append(str(order_data["order_id"]))
+    if extra_search:
+        search_terms.append(str(extra_search))
+
+    if not search_terms:
+        return None
+
+    for search in search_terms:
+        try:
+            r = requests.get(
+                "https://panel.sendcloud.sc/api/v2/parcels",
+                auth=(SC_KEY, SC_SECRET),
+                params={"search": search},
+                timeout=15
+            )
+            parcels = r.json().get("parcels", [])
+            if parcels:
+                p = parcels[0]
+                result = {
+                    "tracking_number": p.get("tracking_number"),
                     "status": p.get("status", {}).get("message", ""),
                     "carrier": p.get("carrier", {}).get("code", ""),
-                    "tracking_url": p.get("tracking_url", "")}
-    except Exception as e:
-        log.warning(f"Sendcloud: {e}")
+                    "tracking_url": p.get("tracking_url", "")
+                }
+                log.info(f"Sendcloud Tracking gefunden (Suche: {search}): {result['carrier']} {result['tracking_number']} - {result['status']}")
+                return result
+        except Exception as e:
+            log.warning(f"Sendcloud: {e}")
+
     return None
 
 
@@ -1008,18 +1061,31 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
     log.info(f"Kategorie: {category} | {subject}")
     sender_email = sender.split("<")[-1].replace(">", "").strip()
 
+    # === INTELLIGENTE BESTELLSUCHE ===
+    order_data = None
+    extra_sendcloud_search = None
+
     # Schritt 1: Bestellnummer aus der Mail extrahieren und direkt suchen
     order_number = extract_order_number(subject, body)
-    order_data = None
     if order_number:
         log.info(f"Bestellnummer aus Mail extrahiert: #{order_number}")
         order_data = fetch_order_by_id(order_number)
+        extra_sendcloud_search = order_number
 
-    # Schritt 2: Fallback - nach E-Mail-Adresse suchen
+    # Schritt 2: Rechnungsnummer extrahieren und darüber Bestellung finden
+    if not order_data:
+        invoice_number = extract_invoice_number(subject, body)
+        if invoice_number:
+            log.info(f"Rechnungsnummer aus Mail extrahiert: {invoice_number}")
+            order_data = find_order_by_invoice_number(invoice_number)
+            if not extra_sendcloud_search:
+                extra_sendcloud_search = invoice_number
+
+    # Schritt 3: Fallback - nach E-Mail-Adresse suchen
     if not order_data:
         order_data = fetch_woocommerce_order(sender_email)
 
-    # Schritt 3: Artikelnummern (SKUs) aus der Mail extrahieren und Produkte nachschlagen
+    # Schritt 4: Artikelnummern (SKUs) aus der Mail extrahieren und Produkte nachschlagen
     skus = extract_sku_codes(subject, body)
     product_data = []
     if skus:
@@ -1029,7 +1095,9 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
             if prod:
                 product_data.append(prod)
 
-    tracking = fetch_sendcloud_tracking(order_data)
+    # Schritt 5: Sendcloud Tracking - mit order_data UND extra Suchbegriff
+    tracking = fetch_sendcloud_tracking(order_data, extra_sendcloud_search)
+
     context  = build_context(sender_email, order_data, tracking, product_data)
 
     # VOLLSTAENDIGEN Body an Claude uebergeben (inkl. Konversations-Historie)
