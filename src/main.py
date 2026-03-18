@@ -1598,16 +1598,14 @@ ebay_processed_ids = set()
 
 
 def ebay_check_messages():
-    """Pruefe eBay-Nachrichten ueber die Trading API (GetMyMessages)."""
+    """Pruefe eBay-Nachrichten ueber die Trading API (GetMyMessages) - nur ungelesene."""
     if not EBAY_ENABLED:
         return
     token = ebay_get_access_token()
     if not token:
         return
     try:
-        # Schritt 1: Nachrichten-IDs der letzten 24h abrufen (GetMyMessages mit MessageStatus=Unanswered)
-        from datetime import datetime, timedelta
-        start_time = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        import re
 
         headers_xml = {
             "X-EBAY-API-SITEID": "77",  # 77 = eBay Deutschland
@@ -1617,14 +1615,13 @@ def ebay_check_messages():
             "Content-Type": "text/xml"
         }
 
-        # Erst die Message-IDs holen
+        # Nur UNGELESENE Nachrichten aus dem Posteingang holen
         xml_request = f"""<?xml version="1.0" encoding="utf-8"?>
 <GetMyMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
     <RequesterCredentials>
         <eBayAuthToken>{token}</eBayAuthToken>
     </RequesterCredentials>
     <FolderID>0</FolderID>
-    <StartTime>{start_time}</StartTime>
     <DetailLevel>ReturnHeaders</DetailLevel>
 </GetMyMessagesRequest>"""
 
@@ -1639,8 +1636,6 @@ def ebay_check_messages():
             log.warning(f"eBay GetMyMessages Fehler {r.status_code}")
             return
 
-        # XML parsen (einfach mit String-Suche, ohne externe Library)
-        import re
         response_text = r.text
 
         # Pruefen ob Fehler
@@ -1650,20 +1645,27 @@ def ebay_check_messages():
             log.warning(f"eBay API Fehler: {error_msg}")
             return
 
-        # Message-IDs extrahieren
-        msg_ids = re.findall(r'<MessageID>(.*?)</MessageID>', response_text)
-        if not msg_ids:
-            log.info("eBay: Keine neuen Nachrichten")
+        # Message-IDs und Read-Status extrahieren
+        # Jede Message hat <MessageID> und <Read>true/false</Read>
+        messages = re.findall(r'<Message>(.*?)</Message>', response_text, re.DOTALL)
+        unread_ids = []
+        for msg_block in messages:
+            mid_match = re.search(r'<MessageID>(.*?)</MessageID>', msg_block)
+            read_match = re.search(r'<Read>(.*?)</Read>', msg_block)
+            if mid_match:
+                msg_id = mid_match.group(1)
+                is_read = read_match and read_match.group(1).lower() == "true"
+                if not is_read:
+                    unread_ids.append(msg_id)
+
+        if not unread_ids:
+            log.info("eBay: Keine ungelesenen Nachrichten")
             return
 
-        # Nur neue, noch nicht verarbeitete Messages
-        new_ids = [mid for mid in msg_ids if mid not in ebay_processed_ids]
-        if not new_ids:
-            log.info(f"eBay: {len(msg_ids)} Nachrichten, alle bereits verarbeitet")
-            return
+        log.info(f"eBay: {len(unread_ids)} ungelesene Nachrichten gefunden")
 
-        # Schritt 2: Details fuer jede neue Nachricht abrufen
-        for msg_id in new_ids[:5]:  # Max 5 auf einmal
+        # Schritt 2: Details fuer jede ungelesene Nachricht abrufen
+        for msg_id in unread_ids[:5]:  # Max 5 auf einmal
             detail_xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <GetMyMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
     <RequesterCredentials>
@@ -1738,12 +1740,45 @@ def ebay_check_messages():
                     channel="ebay", ebay_thread_id=ext_id,
                     ebay_item_id=item_id, ebay_recipient=sender
                 )
-                ebay_processed_ids.add(msg_id)
 
-        log.info(f"eBay: {len(new_ids)} neue Nachrichten verarbeitet")
+                # Nachricht bei eBay als gelesen markieren (damit sie nicht nochmal kommt)
+                ebay_mark_as_read(token, msg_id, headers_xml)
+
+        log.info(f"eBay: {len(unread_ids)} ungelesene Nachrichten verarbeitet")
 
     except Exception as e:
         log.warning(f"eBay Messages: {e}")
+
+
+def ebay_mark_as_read(token, message_id, headers_xml):
+    """Markiere eine eBay-Nachricht als gelesen ueber ReviseMyMessages."""
+    try:
+        headers_xml_rev = dict(headers_xml)
+        headers_xml_rev["X-EBAY-API-CALL-NAME"] = "ReviseMyMessages"
+
+        xml_request = f"""<?xml version="1.0" encoding="utf-8"?>
+<ReviseMyMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <RequesterCredentials>
+        <eBayAuthToken>{token}</eBayAuthToken>
+    </RequesterCredentials>
+    <MessageIDs>
+        <MessageID>{message_id}</MessageID>
+    </MessageIDs>
+    <Read>true</Read>
+</ReviseMyMessagesRequest>"""
+
+        r = requests.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=headers_xml_rev,
+            data=xml_request.encode("utf-8"),
+            timeout=10
+        )
+        if r.status_code == 200 and "<Ack>Success</Ack>" in r.text:
+            log.info(f"eBay Nachricht {message_id} als gelesen markiert")
+        else:
+            log.warning(f"eBay Nachricht als gelesen markieren fehlgeschlagen: {r.text[:100]}")
+    except Exception as e:
+        log.warning(f"eBay mark as read: {e}")
 
 
 def ebay_send_reply(inquiry_id, message_text, recipient=None, item_id=None):
