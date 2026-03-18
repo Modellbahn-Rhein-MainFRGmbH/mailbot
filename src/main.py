@@ -1296,9 +1296,34 @@ def handle_telegram_update(update):
             delete_telegram_messages(tg_ids)
 
     elif "message" in update:
-        text = update["message"].get("text", "")
-        if not text or text.startswith("/"):
+        text = update["message"].get("text", "").strip()
+        msg_id = update["message"].get("message_id")
+
+        if not text:
             return
+
+        # Befehle verarbeiten
+        if text == "/clean" or text == "/clean@ModellbahnAssistentBot":
+            clean_telegram_chat(msg_id)
+            return
+
+        if text == "/status" or text == "/status@ModellbahnAssistentBot":
+            fb_count = len(load_feedback())
+            pending_count = len(pending)
+            ebay_status = "aktiv" if EBAY_ENABLED else "nicht konfiguriert"
+            status_msg = (
+                f"📊 <b>Bot-Status</b>\n"
+                f"Offene Vorgaenge: {pending_count}\n"
+                f"Korrekturen im Archiv: {fb_count}\n"
+                f"eBay API: {ebay_status}\n"
+                f"eBay verarbeitet: {len(ebay_processed_ids)} Nachrichten"
+            )
+            send_telegram_text(status_msg)
+            return
+
+        if text.startswith("/"):
+            return
+
         for token, p in list(pending.items()):
             if p.get("awaiting_edit"):
                 lines    = p["draft"].split("\n")
@@ -1353,6 +1378,35 @@ def handle_telegram_update(update):
                 )
                 pending[token]["telegram_msg_ids"] = new_tg_ids or []
                 break
+
+
+def clean_telegram_chat(command_msg_id=None):
+    """Loesche alle Bot-Nachrichten aus dem Telegram-Chat (Inbox Zero)."""
+    try:
+        # Zuerst das /clean Kommando selbst loeschen
+        if command_msg_id:
+            delete_telegram_messages([command_msg_id])
+
+        # Sonde senden um aktuelle Message-ID zu bekommen
+        probe = send_telegram_text("🧹 Räume auf...")
+        if probe:
+            # Loesche von probe-ID rueckwaerts (max 300 Nachrichten, ca. 48h)
+            for mid in range(probe, max(probe - 300, 0), -1):
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/deleteMessage",
+                        json={"chat_id": TG_CHAT_ID, "message_id": mid},
+                        timeout=2
+                    )
+                except:
+                    pass
+
+        send_telegram_text("✨ Chat aufgeräumt!")
+        log.info("Telegram Chat aufgeraeumt via /clean")
+
+    except Exception as e:
+        log.warning(f"Chat aufraeumen: {e}")
+        send_telegram_text("⚠️ Konnte nicht alle Nachrichten löschen.")
 
 
 # ============================================================
