@@ -676,14 +676,15 @@ def build_context(sender_email, order_data, tracking_data, product_data=None):
 
 
 def generate_draft(subject, body, sender, channel, context, category):
-    """Antwort generieren mit Kategorie und Feedback-Kontext."""
+    """Antwort generieren mit Kategorie und Feedback-Kontext.
+    Der VOLLSTAENDIGE Mail-Body wird uebergeben, inkl. Konversations-Historie."""
     channel_hint = "eBay-Nachricht" if channel == "ebay" else "Shop-Mail"
     feedback_section = build_feedback_prompt()
     full_system = SYSTEM_PROMPT + feedback_section
 
     resp = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1000,
+        max_tokens=1500,
         system=full_system,
         messages=[{"role": "user", "content": (
             f"Kanal: {channel_hint}\n"
@@ -691,7 +692,10 @@ def generate_draft(subject, body, sender, channel, context, category):
             f"Absender: {sender}\n"
             f"Betreff: {subject}\n\n"
             f"BESTELLDATEN:\n{context}\n\n"
-            f"KUNDEN-NACHRICHT:\n{body}\n\n"
+            f"KUNDEN-NACHRICHT (inkl. evtl. vorheriger Mail-Verlauf):\n{body}\n\n"
+            f"WICHTIG: Falls die Nachricht einen Mail-Verlauf enthaelt (zitierte fruehere Nachrichten), "
+            f"beruecksichtige den GESAMTEN Kontext der bisherigen Konversation fuer deine Antwort. "
+            f"Antworte nur auf die NEUESTE Nachricht des Kunden, aber mit Wissen ueber den gesamten Verlauf.\n\n"
             f"Erstelle die fertige Antwort. Beachte die kategorie-spezifischen Anweisungen fuer '{category}'.\n"
             f"Erste Zeile: BETREFF: Re: {subject}"
         )}]
@@ -719,7 +723,65 @@ def send_telegram_photo(image_data, caption=""):
         log.error(f"Telegram Foto: {e}")
 
 
-def send_approval_request(token, sender, subject, body, draft, channel, order_context, images, category):
+def detect_language(text):
+    """Sprache eines Textes erkennen (einfache Heuristik)."""
+    # Deutsche Indikatoren
+    german_words = ["sehr", "geehrte", "guten", "bitte", "danke", "liebe", "grüße", "gruesse",
+                    "bestellung", "lieferung", "rechnung", "frage", "artikel", "haben", "können",
+                    "moechte", "wäre", "würde", "freundlichen", "melden", "vielen", "dank"]
+    text_lower = text.lower()
+    german_count = sum(1 for w in german_words if w in text_lower)
+    # Wenn wenig deutsche Woerter und genuegend Text -> vermutlich fremdsprachig
+    if len(text) > 50 and german_count < 2:
+        return "foreign"
+    return "german"
+
+
+def translate_to_german(text, label="Text"):
+    """Uebersetze einen Text ins Deutsche via Claude."""
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            messages=[{"role": "user", "content": (
+                f"Uebersetze den folgenden Text ins Deutsche. "
+                f"Antworte NUR mit der deutschen Uebersetzung, keine Erklaerungen.\n\n{text}"
+            )}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        log.warning(f"Uebersetzung fehlgeschlagen: {e}")
+        return None
+
+
+def send_long_telegram_text(text, reply_markup=None):
+    """Telegram-Nachricht senden, bei Bedarf in mehrere Teile aufgeteilt (Limit: 4096 Zeichen)."""
+    MAX_LEN = 4000  # Etwas unter 4096 fuer Sicherheit
+    if len(text) <= MAX_LEN:
+        send_telegram_text(text, reply_markup)
+        return
+
+    # Text in Teile aufsplitten
+    parts = []
+    while text:
+        if len(text) <= MAX_LEN:
+            parts.append(text)
+            break
+        # Am letzten Zeilenumbruch vor dem Limit trennen
+        split_pos = text.rfind("\n", 0, MAX_LEN)
+        if split_pos < MAX_LEN // 2:
+            split_pos = MAX_LEN
+        parts.append(text[:split_pos])
+        text = text[split_pos:].lstrip("\n")
+
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1 and reply_markup:
+            send_telegram_text(part, reply_markup)
+        else:
+            send_telegram_text(part)
+
+
+def send_approval_request(token, sender, subject, body, draft, channel, order_context, images, category, translation_customer=None, translation_draft=None):
     lines        = draft.split("\n")
     mail_body    = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
     kanal        = "🏪 eBay" if channel == "ebay" else "🛒 Shop"
@@ -732,30 +794,53 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
     }
     cat_icon = cat_emoji.get(category, "📧")
 
-    body_preview = body.strip()[:500] + ("..." if len(body.strip()) > 500 else "")
-    ctx_short    = order_context[:300] + ("..." if len(order_context) > 300 else "")
-    draft_prev   = mail_body[:500] + ("..." if len(mail_body) > 500 else "")
+    # VOLLSTAENDIGER Body - kein Kuerzen mehr!
+    full_body = body.strip()
+    ctx_display = order_context
 
+    # Nachricht zusammenbauen
     msg = (
         f"{kanal} {cat_icon} <b>{category.upper()}</b>\n"
         f"Von: <code>{sender}</code>\n"
         f"Betreff: {subject}\n\n"
         f"<b>Kunden-Nachricht:</b>\n"
         f"--------------------\n"
-        f"{body_preview}\n"
-        f"--------------------\n\n"
-        f"<b>Bestelldaten:</b>\n<code>{ctx_short}</code>\n\n"
-        f"<b>Mein Vorschlag:</b>\n"
-        f"--------------------\n"
-        f"{draft_prev}\n"
+        f"{full_body}\n"
         f"--------------------"
     )
+
+    # Bei fremdsprachigen Mails: Deutsche Uebersetzung anhaengen
+    if translation_customer:
+        msg += (
+            f"\n\n🌐 <b>Deutsche Übersetzung (Kunden-Nachricht):</b>\n"
+            f"--------------------\n"
+            f"{translation_customer}\n"
+            f"--------------------"
+        )
+
+    msg += (
+        f"\n\n<b>Bestelldaten:</b>\n<code>{ctx_display}</code>\n\n"
+        f"<b>Mein Vorschlag:</b>\n"
+        f"--------------------\n"
+        f"{mail_body}\n"
+        f"--------------------"
+    )
+
+    # Bei fremdsprachigen Antworten: Deutsche Uebersetzung anhaengen
+    if translation_draft:
+        msg += (
+            f"\n\n🌐 <b>Deutsche Übersetzung (Antwort):</b>\n"
+            f"--------------------\n"
+            f"{translation_draft}\n"
+            f"--------------------"
+        )
+
     keyboard = {"inline_keyboard": [
         [{"text": "✅ Senden",      "callback_data": f"approve:{token}"},
          {"text": "✏️ Aendern",    "callback_data": f"edit:{token}"}],
         [{"text": "🗑️ Ignorieren", "callback_data": f"ignore:{token}"}]
     ]}
-    send_telegram_text(msg, keyboard)
+    send_long_telegram_text(msg, keyboard)
     for i, img in enumerate(images):
         send_telegram_photo(img, f"📷 Bild {i+1} von {len(images)}")
 
@@ -946,15 +1031,34 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
 
     tracking = fetch_sendcloud_tracking(order_data)
     context  = build_context(sender_email, order_data, tracking, product_data)
-    draft    = generate_draft(subject, body, sender, channel, context, category)
+
+    # VOLLSTAENDIGEN Body an Claude uebergeben (inkl. Konversations-Historie)
+    draft = generate_draft(subject, body, sender, channel, context, category)
+
+    # Sprache erkennen und ggf. uebersetzen
+    translation_customer = None
+    translation_draft = None
+    lang = detect_language(body)
+    if lang == "foreign":
+        log.info("Fremdsprachige Mail erkannt - uebersetze fuer Fabian")
+        translation_customer = translate_to_german(body, "Kunden-Nachricht")
+        # Auch den Antwort-Entwurf uebersetzen
+        draft_body = "\n".join(l for l in draft.split("\n") if not l.startswith("BETREFF:")).strip()
+        translation_draft = translate_to_german(draft_body, "Antwort-Entwurf")
+
     pending[token] = {
         "sender": sender_email, "subject": subject, "body": body,
         "draft": draft, "channel": channel, "category": category,
         "ebay_thread_id": ebay_thread_id,
         "order_id": order_data.get("order_id") if order_data else None,
-        "order_context": context, "images": images or []
+        "order_context": context, "images": images or [],
+        "translation_customer": translation_customer,
+        "translation_draft": translation_draft
     }
-    send_approval_request(token, sender_email, subject, body, draft, channel, context, images or [], category)
+    send_approval_request(
+        token, sender_email, subject, body, draft, channel, context,
+        images or [], category, translation_customer, translation_draft
+    )
     log.info(f"Entwurf gesendet fuer {sender_email} (Token: {token}, Kategorie: {category})")
 
 
@@ -1097,10 +1201,20 @@ def handle_telegram_update(update):
 
                 pending[token]["draft"]         = new_draft
                 pending[token]["awaiting_edit"] = False
+
+                # Bei fremdsprachiger Korrektur: neue Uebersetzung
+                translation_draft = None
+                if p.get("translation_customer"):
+                    draft_text = "\n".join(l for l in new_draft.split("\n") if not l.startswith("BETREFF:")).strip()
+                    translation_draft = translate_to_german(draft_text, "Antwort-Entwurf")
+                    pending[token]["translation_draft"] = translation_draft
+
                 send_approval_request(
                     token, p["sender"], p["subject"], p["body"],
                     new_draft, p["channel"], p["order_context"], p["images"],
-                    p.get("category", "unbekannt")
+                    p.get("category", "unbekannt"),
+                    p.get("translation_customer"),
+                    translation_draft or p.get("translation_draft")
                 )
                 break
 
