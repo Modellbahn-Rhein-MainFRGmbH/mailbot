@@ -1314,7 +1314,7 @@ def ebay_get_access_token():
             data={
                 "grant_type": "refresh_token",
                 "refresh_token": EBAY_REFRESH_TOKEN,
-                "scope": "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.fulfillment"
+                "scope": "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/commerce.notification.subscription https://api.ebay.com/oauth/api_scope/sell.inventory"
             },
             timeout=15
         )
@@ -1329,70 +1329,185 @@ def ebay_get_access_token():
     return None
 
 
+# Bereits verarbeitete eBay-Nachrichten merken (um Duplikate zu vermeiden)
+ebay_processed_ids = set()
+
+
 def ebay_check_messages():
-    """Pruefe eBay-Nachrichten ueber die Post-Order API."""
+    """Pruefe eBay-Nachrichten ueber die Trading API (GetMyMessages)."""
     if not EBAY_ENABLED:
         return
     token = ebay_get_access_token()
     if not token:
         return
     try:
-        # eBay Member Messages abrufen (letzte 24h, unbeantwortet)
-        r = requests.get(
-            "https://api.ebay.com/post-order/v2/inquiry/search",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "X-EBAY-C-MARKETPLACE-ID": "EBAY_DE"
-            },
-            params={"status": "OPEN", "limit": 10},
+        # Schritt 1: Nachrichten-IDs der letzten 24h abrufen (GetMyMessages mit MessageStatus=Unanswered)
+        from datetime import datetime, timedelta
+        start_time = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        headers_xml = {
+            "X-EBAY-API-SITEID": "77",  # 77 = eBay Deutschland
+            "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
+            "X-EBAY-API-CALL-NAME": "GetMyMessages",
+            "X-EBAY-API-IAF-TOKEN": token,
+            "Content-Type": "text/xml"
+        }
+
+        # Erst die Message-IDs holen
+        xml_request = f"""<?xml version="1.0" encoding="utf-8"?>
+<GetMyMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <RequesterCredentials>
+        <eBayAuthToken>{token}</eBayAuthToken>
+    </RequesterCredentials>
+    <FolderID>0</FolderID>
+    <StartTime>{start_time}</StartTime>
+    <DetailLevel>ReturnHeaders</DetailLevel>
+</GetMyMessagesRequest>"""
+
+        r = requests.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=headers_xml,
+            data=xml_request.encode("utf-8"),
             timeout=20
         )
-        if r.status_code == 200:
-            inquiries = r.json().get("members", [])
-            for inq in inquiries:
-                msg_id  = inq.get("inquiryId", "")
-                buyer   = inq.get("buyer", {}).get("username", "unbekannt")
-                subject = inq.get("subject", "eBay Anfrage")
-                body    = inq.get("description", "")
-                item    = inq.get("itemId", "")
 
-                if body:
-                    full_subject = f"[eBay] {subject} (Artikel: {item})"
-                    process_mail(
-                        full_subject, buyer, body,
-                        channel="ebay", ebay_thread_id=msg_id
-                    )
-            log.info(f"eBay: {len(inquiries)} offene Anfragen geprueft")
-        else:
-            log.warning(f"eBay Messages {r.status_code}: {r.text[:200]}")
+        if r.status_code != 200:
+            log.warning(f"eBay GetMyMessages Fehler {r.status_code}")
+            return
+
+        # XML parsen (einfach mit String-Suche, ohne externe Library)
+        import re
+        response_text = r.text
+
+        # Pruefen ob Fehler
+        if "<Ack>Failure</Ack>" in response_text:
+            error_match = re.search(r'<LongMessage>(.*?)</LongMessage>', response_text)
+            error_msg = error_match.group(1) if error_match else "Unbekannt"
+            log.warning(f"eBay API Fehler: {error_msg}")
+            return
+
+        # Message-IDs extrahieren
+        msg_ids = re.findall(r'<MessageID>(.*?)</MessageID>', response_text)
+        if not msg_ids:
+            log.info("eBay: Keine neuen Nachrichten")
+            return
+
+        # Nur neue, noch nicht verarbeitete Messages
+        new_ids = [mid for mid in msg_ids if mid not in ebay_processed_ids]
+        if not new_ids:
+            log.info(f"eBay: {len(msg_ids)} Nachrichten, alle bereits verarbeitet")
+            return
+
+        # Schritt 2: Details fuer jede neue Nachricht abrufen
+        for msg_id in new_ids[:5]:  # Max 5 auf einmal
+            detail_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<GetMyMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <RequesterCredentials>
+        <eBayAuthToken>{token}</eBayAuthToken>
+    </RequesterCredentials>
+    <MessageIDs>
+        <MessageID>{msg_id}</MessageID>
+    </MessageIDs>
+    <DetailLevel>ReturnMessages</DetailLevel>
+</GetMyMessagesRequest>"""
+
+            r2 = requests.post(
+                "https://api.ebay.com/ws/api.dll",
+                headers=headers_xml,
+                data=detail_xml.encode("utf-8"),
+                timeout=20
+            )
+
+            if r2.status_code != 200:
+                continue
+
+            detail_text = r2.text
+
+            # Nachrichtendetails extrahieren
+            sender_match = re.search(r'<Sender>(.*?)</Sender>', detail_text)
+            subject_match = re.search(r'<Subject>(.*?)</Subject>', detail_text)
+            body_match = re.search(r'<Text>(.*?)</Text>', detail_text, re.DOTALL)
+            item_match = re.search(r'<ItemID>(.*?)</ItemID>', detail_text)
+            ext_msg_id_match = re.search(r'<ExternalMessageID>(.*?)</ExternalMessageID>', detail_text)
+
+            sender = sender_match.group(1) if sender_match else "eBay-Kaeufer"
+            subject = subject_match.group(1) if subject_match else "eBay Nachricht"
+            body = body_match.group(1) if body_match else ""
+            item_id = item_match.group(1) if item_match else ""
+            ext_id = ext_msg_id_match.group(1) if ext_msg_id_match else msg_id
+
+            # HTML aus Body entfernen falls vorhanden
+            body = re.sub(r'<[^>]+>', ' ', body)
+            body = body.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+            body = body.replace('&nbsp;', ' ').replace('&quot;', '"')
+            body = re.sub(r'\s+', ' ', body).strip()
+
+            if body and sender:
+                full_subject = f"[eBay] {subject}"
+                if item_id:
+                    full_subject += f" (Artikel: {item_id})"
+
+                log.info(f"eBay Nachricht von {sender}: {subject}")
+                process_mail(
+                    full_subject, sender, body,
+                    channel="ebay", ebay_thread_id=ext_id
+                )
+                ebay_processed_ids.add(msg_id)
+
+        log.info(f"eBay: {len(new_ids)} neue Nachrichten verarbeitet")
+
     except Exception as e:
         log.warning(f"eBay Messages: {e}")
 
 
 def ebay_send_reply(inquiry_id, message_text):
-    """Antwort ueber eBay zurueckschicken (nicht per Mail)."""
+    """Antwort ueber eBay Trading API zurueckschicken (AddMemberMessageRTQ)."""
     if not EBAY_ENABLED:
         return False
     token = ebay_get_access_token()
     if not token:
         return False
     try:
+        import re
+        headers_xml = {
+            "X-EBAY-API-SITEID": "77",
+            "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
+            "X-EBAY-API-CALL-NAME": "AddMemberMessageRTQ",
+            "X-EBAY-API-IAF-TOKEN": token,
+            "Content-Type": "text/xml"
+        }
+
+        # HTML-Sonderzeichen escapen
+        safe_text = message_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        xml_request = f"""<?xml version="1.0" encoding="utf-8"?>
+<AddMemberMessageRTQRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <RequesterCredentials>
+        <eBayAuthToken>{token}</eBayAuthToken>
+    </RequesterCredentials>
+    <MemberMessage>
+        <Body>{safe_text}</Body>
+        <ParentMessageID>{inquiry_id}</ParentMessageID>
+    </MemberMessage>
+</AddMemberMessageRTQRequest>"""
+
         r = requests.post(
-            f"https://api.ebay.com/post-order/v2/inquiry/{inquiry_id}/send_message",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "X-EBAY-C-MARKETPLACE-ID": "EBAY_DE"
-            },
-            json={"message": message_text},
+            "https://api.ebay.com/ws/api.dll",
+            headers=headers_xml,
+            data=xml_request.encode("utf-8"),
             timeout=15
         )
-        if r.status_code in (200, 201, 204):
-            log.info(f"eBay Antwort gesendet (Inquiry: {inquiry_id})")
+
+        if r.status_code == 200 and "<Ack>Success</Ack>" in r.text:
+            log.info(f"eBay Antwort gesendet (Message: {inquiry_id})")
+            return True
+        elif r.status_code == 200 and "<Ack>Warning</Ack>" in r.text:
+            log.info(f"eBay Antwort gesendet mit Warnung (Message: {inquiry_id})")
             return True
         else:
-            log.error(f"eBay Antwort Fehler {r.status_code}: {r.text[:200]}")
+            error_match = re.search(r'<LongMessage>(.*?)</LongMessage>', r.text)
+            error_msg = error_match.group(1) if error_match else r.text[:200]
+            log.error(f"eBay Antwort Fehler: {error_msg}")
     except Exception as e:
         log.error(f"eBay Antwort: {e}")
     return False
