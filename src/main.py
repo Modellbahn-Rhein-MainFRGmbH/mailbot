@@ -448,21 +448,33 @@ def classify_mail(subject, body):
 # ============================================================
 
 def extract_order_number(subject, body):
-    """Bestellnummer aus Betreff oder Mailtext extrahieren."""
+    """Bestellnummer aus Betreff oder Mailtext extrahieren.
+    Ignoriert eBay-Artikelnummern (12+ Ziffern) und eBay-spezifische Nummern."""
     import re
+
+    # Bei eBay-Nachrichten: Nur nach explizit genannten Bestellnummern suchen, nicht nach Artikel-IDs
+    is_ebay = "[eBay]" in subject
+
     text = f"{subject} {body}"
-    # Typische Muster: #1540592, Bestellnummer 1540592, Bestellung 1540592, Order 1540592
     patterns = [
-        r'#\s*(\d{4,})',                           # #1540592
-        r'[Bb]estell(?:ung|nummer)[:\s#]*(\d{4,})', # Bestellnummer 1540592, Bestellung 1540592
-        r'[Oo]rder[:\s#]*(\d{4,})',                 # Order 1540592
-        r'[Aa]uftrag[:\s#]*(\d{4,})',               # Auftrag 1540592
-        r'(?:Nr|Nummer)[.:\s]*(\d{4,})',            # Nr. 1540592
+        r'[Bb]estell(?:ung|nummer)[:\s#]*(\d{4,8})',  # Bestellnummer 1540592 (max 8 Ziffern)
+        r'[Oo]rder[:\s#]*(\d{4,8})',                   # Order 1540592
+        r'[Aa]uftrag[:\s#]*(\d{4,8})',                 # Auftrag 1540592
     ]
+
+    # #-Muster nur bei Nicht-eBay-Mails (sonst matcht es eBay Artikelnummern)
+    if not is_ebay:
+        patterns.insert(0, r'#\s*(\d{4,8})')           # #1540592
+        patterns.append(r'(?:Nr|Nummer)[.:\s]*(\d{4,8})')  # Nr. 1540592
+
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            return match.group(1)
+            num = match.group(1)
+            # eBay-Artikelnummern haben 12+ Ziffern - die ignorieren
+            if len(num) >= 10:
+                continue
+            return num
     return None
 
 
@@ -1543,7 +1555,11 @@ def ebay_check_messages():
             if r2.status_code != 200:
                 continue
 
-            detail_text = r2.text
+            # Encoding sicherstellen (eBay sendet manchmal Latin-1)
+            try:
+                detail_text = r2.content.decode("utf-8")
+            except UnicodeDecodeError:
+                detail_text = r2.content.decode("latin-1", errors="replace")
 
             # Nachrichtendetails extrahieren
             sender_match = re.search(r'<Sender>(.*?)</Sender>', detail_text)
@@ -1551,6 +1567,9 @@ def ebay_check_messages():
             body_match = re.search(r'<Text>(.*?)</Text>', detail_text, re.DOTALL)
             item_match = re.search(r'<ItemID>(.*?)</ItemID>', detail_text)
             ext_msg_id_match = re.search(r'<ExternalMessageID>(.*?)</ExternalMessageID>', detail_text)
+            # Auch ResponseDetails/MessageType pruefen ob es eine eingehende Nachricht ist
+            msg_type_match = re.search(r'<MessageType>(.*?)</MessageType>', detail_text)
+            is_question = not msg_type_match or msg_type_match.group(1) != "AskSellerQuestion"
 
             sender = sender_match.group(1) if sender_match else "eBay-Kaeufer"
             subject = subject_match.group(1) if subject_match else "eBay Nachricht"
@@ -1561,15 +1580,24 @@ def ebay_check_messages():
             # HTML aus Body entfernen falls vorhanden
             body = re.sub(r'<[^>]+>', ' ', body)
             body = body.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-            body = body.replace('&nbsp;', ' ').replace('&quot;', '"')
+            body = body.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&apos;', "'")
             body = re.sub(r'\s+', ' ', body).strip()
 
-            if body and sender:
+            # Auch Subject bereinigen
+            subject = subject.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+            subject = subject.replace('&quot;', '"').replace('&apos;', "'")
+
+            if sender:
+                # eBay-Artikel-ID im Betreff markieren (aber NICHT als Bestellnummer verwenden)
                 full_subject = f"[eBay] {subject}"
                 if item_id:
                     full_subject += f" (Artikel: {item_id})"
 
-                log.info(f"eBay Nachricht von {sender}: {subject}")
+                # Body kann leer sein bei manchen eBay-Nachrichten - trotzdem weiterleiten
+                if not body:
+                    body = f"(Kunde hat eine Nachricht zu Artikel {item_id} gesendet, aber kein Text enthalten. Betreff: {subject})"
+
+                log.info(f"eBay Nachricht von {sender}: {subject} | Body: {body[:100]}")
                 process_mail(
                     full_subject, sender, body,
                     channel="ebay", ebay_thread_id=ext_id,
