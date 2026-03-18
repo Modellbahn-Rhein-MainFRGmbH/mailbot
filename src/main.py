@@ -1128,7 +1128,7 @@ def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_fi
         log.warning(f"Gesendet-Ordner: {e} (Mail wurde trotzdem gesendet)")
 
 
-def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None, ebay_item_id=None, ebay_recipient=None, original_message_id=None, original_references=None):
+def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None, ebay_item_id=None, ebay_recipient=None, original_message_id=None, original_references=None, imap_uid=None):
     token = hashlib.md5(f"{sender}{subject}{body[:50]}".encode()).hexdigest()[:8]
     if token in pending:
         return
@@ -1207,6 +1207,7 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
         "translation_draft": translation_draft,
         "original_message_id": original_message_id,
         "original_references": original_references,
+        "imap_uid": imap_uid,
         "telegram_msg_ids": []
     }
     tg_msg_ids = send_approval_request(
@@ -1243,6 +1244,8 @@ def check_inbox():
                 # eBay-Mails ignorieren (werden ueber eBay API abgerufen)
                 if is_ebay_notification(sender):
                     log.info(f"eBay-Mail ignoriert: {subject}")
+                    # eBay-Mails trotzdem als gelesen markieren damit sie nicht nochmal kommen
+                    imap.store(mid, '+FLAGS', '\\Seen')
                     continue
 
                 # Message-ID und References fuer Threading speichern
@@ -1252,7 +1255,8 @@ def check_inbox():
                 body, images = get_mail_body_and_images(msg)
                 process_mail(subject, sender, body, channel="shop", images=images,
                             original_message_id=original_message_id,
-                            original_references=original_references)
+                            original_references=original_references,
+                            imap_uid=mid.decode() if isinstance(mid, bytes) else str(mid))
     except Exception as e:
         log.error(f"IMAP: {e}")
 
@@ -1316,12 +1320,25 @@ def handle_telegram_update(update):
             del pending[token]
             if ok:
                 send_telegram_text(f"✅ {channel_label} an <code>{p['sender']}</code> gesendet!")
+                # Mail als gelesen + beantwortet markieren (Antwort-Pfeil in Apple Mail)
+                mark_mail_as_seen(p.get("imap_uid"))
+                mark_mail_as_answered(p.get("imap_uid"))
+                # Statistik
+                reset_daily_stats_if_needed()
+                daily_stats["answered"] += 1
+                if p.get("channel") == "ebay":
+                    daily_stats["ebay_answered"] += 1
+                else:
+                    daily_stats["shop_answered"] += 1
             else:
                 send_telegram_text(f"⚠️ Fehler! Bitte manuell antworten an {p['sender']}")
             # Alte Nachrichten aus Telegram loeschen
             delete_telegram_messages(p.get("telegram_msg_ids", []))
         elif action == "edit":
             pending[token]["awaiting_edit"] = True
+            # Statistik: Korrektur zaehlen
+            reset_daily_stats_if_needed()
+            daily_stats["edited"] += 1
             send_telegram_text(
                 f"✏️ Was soll ich aendern?\n\n"
                 f"Beispiele:\n"
@@ -1333,6 +1350,11 @@ def handle_telegram_update(update):
             )
         elif action == "ignore":
             tg_ids = p.get("telegram_msg_ids", [])
+            # Mail als gelesen markieren
+            mark_mail_as_seen(p.get("imap_uid"))
+            # Statistik
+            reset_daily_stats_if_needed()
+            daily_stats["ignored"] += 1
             del pending[token]
             send_telegram_text("🗑️ Vorgang ignoriert.")
             # Alte Nachrichten aus Telegram loeschen
@@ -1362,6 +1384,11 @@ def handle_telegram_update(update):
                 f"eBay verarbeitet: {len(ebay_processed_ids)} Nachrichten"
             )
             send_telegram_text(status_msg)
+            return
+
+        if text == "/stats" or text == "/stats@ModellbahnAssistentBot":
+            reset_daily_stats_if_needed()
+            send_daily_summary()
             return
 
         if text.startswith("/"):
@@ -1450,6 +1477,78 @@ def clean_telegram_chat(command_msg_id=None):
     except Exception as e:
         log.warning(f"Chat aufraeumen: {e}")
         send_telegram_text("⚠️ Konnte nicht alle Nachrichten löschen.")
+
+
+def mark_mail_as_seen(imap_uid):
+    """Markiere eine Mail als gelesen per IMAP."""
+    if not imap_uid:
+        return
+    try:
+        with imaplib.IMAP4_SSL(MAIL_HOST) as imap:
+            imap.login(MAIL_USER, MAIL_PASS)
+            imap.select("INBOX")
+            imap.store(imap_uid.encode() if isinstance(imap_uid, str) else imap_uid, '+FLAGS', '\\Seen')
+            log.info(f"Mail als gelesen markiert (UID: {imap_uid})")
+    except Exception as e:
+        log.warning(f"Mail als gelesen markieren: {e}")
+
+
+def mark_mail_as_answered(imap_uid):
+    """Markiere eine Mail als beantwortet per IMAP (zeigt Antwort-Pfeil in Apple Mail)."""
+    if not imap_uid:
+        return
+    try:
+        with imaplib.IMAP4_SSL(MAIL_HOST) as imap:
+            imap.login(MAIL_USER, MAIL_PASS)
+            imap.select("INBOX")
+            imap.store(imap_uid.encode() if isinstance(imap_uid, str) else imap_uid, '+FLAGS', '\\Answered')
+            log.info(f"Mail als beantwortet markiert (UID: {imap_uid})")
+    except Exception as e:
+        log.warning(f"Mail als beantwortet markieren: {e}")
+
+
+# ============================================================
+# TAGES-STATISTIK
+# ============================================================
+
+daily_stats = {
+    "date": "",
+    "answered": 0,
+    "ignored": 0,
+    "edited": 0,
+    "ebay_answered": 0,
+    "shop_answered": 0
+}
+
+
+def reset_daily_stats_if_needed():
+    """Setze Statistik zurueck wenn ein neuer Tag beginnt."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if daily_stats["date"] != today:
+        daily_stats["date"] = today
+        daily_stats["answered"] = 0
+        daily_stats["ignored"] = 0
+        daily_stats["edited"] = 0
+        daily_stats["ebay_answered"] = 0
+        daily_stats["shop_answered"] = 0
+
+
+def send_daily_summary():
+    """Sende Tages-Zusammenfassung per Telegram (abends um 20:00)."""
+    total = daily_stats["answered"] + daily_stats["ignored"]
+    if total == 0:
+        return  # Nichts zu berichten
+
+    msg = (
+        f"📊 <b>Tages-Zusammenfassung ({daily_stats['date']})</b>\n\n"
+        f"✅ Beantwortet: {daily_stats['answered']}\n"
+        f"   🛒 Shop: {daily_stats['shop_answered']}\n"
+        f"   🏪 eBay: {daily_stats['ebay_answered']}\n"
+        f"✏️ Davon korrigiert: {daily_stats['edited']}\n"
+        f"🗑️ Ignoriert: {daily_stats['ignored']}\n"
+        f"📬 Gesamt verarbeitet: {total}"
+    )
+    send_telegram_text(msg)
 
 
 # ============================================================
@@ -1726,6 +1825,7 @@ def main():
     offset     = 0
     mail_timer = 0
     ebay_timer = 0
+    summary_sent_today = False
     while True:
         updates = get_telegram_updates(offset)
         for upd in updates:
@@ -1738,6 +1838,13 @@ def main():
         if EBAY_ENABLED and time.time() - ebay_timer > 180:
             ebay_check_messages()
             ebay_timer = time.time()
+        # Tages-Zusammenfassung um 20:00 senden
+        current_hour = datetime.now().hour
+        if current_hour == 20 and not summary_sent_today:
+            send_daily_summary()
+            summary_sent_today = True
+        elif current_hour != 20:
+            summary_sent_today = False
         time.sleep(2)
 
 
