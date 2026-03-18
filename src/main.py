@@ -225,6 +225,7 @@ Bei PRODUKTFRAGE:
 - Wenn Artikel "Auf Lager": Verfuegbarkeit bestaetigen, Preis nennen, ggf. Shop-Link mitgeben. Hinweis: Nur einmal vorhanden, schnell zugreifen.
 - Wenn Artikel "Ausverkauft": Ehrlich sagen, dass er leider schon verkauft wurde. NICHT "nachbestellen" anbieten. Auf kommende Sammlungen/Ankuendigungen verweisen.
 - Wenn du die Antwort nicht weisst: Ehrlich sagen und Rueckruf/Mail anbieten.
+- WICHTIG bei eBay-Anfragen: Der Preis in den ARTIKEL-INFORMATIONEN ist der SHOP-Preis. Der eBay-Preis ist ca. 8% hoeher. Bei eBay-Nachrichten NICHT den Shop-Preis nennen, sondern nur auf Verfuegbarkeit eingehen. Den Kunden auf den guenstigeren gleichnamigen Online-Shop hinweisen.
 
 Bei STORNIERUNG:
 - Pruefen ob Bestellung schon versendet wurde (Sendcloud-Daten).
@@ -503,22 +504,36 @@ def find_order_by_invoice_number(invoice_number):
 
 def extract_sku_codes(subject, body):
     """Artikelnummern (SKUs) aus Betreff oder Mailtext extrahieren.
-    Format: Buchstaben + Zahlen ohne Leerzeichen, z.B. KAD0007, SRT37, JB051"""
+    Format: Buchstaben + Zahlen ohne Leerzeichen, z.B. KAD0007, SRT37, JB051
+    Typische Praefixe: KAD, SRT, JB, THE, SAL, THX etc."""
     import re
     text = f"{subject} {body}"
-    # SKU-Muster: 2-5 Buchstaben gefolgt von 1-6 Ziffern (z.B. KAD0007, SRT37, JB051, THE407)
-    matches = re.findall(r'\b([A-Za-z]{2,5}\d{1,6})\b', text)
+
+    # Bekannte SKU-Praefixe von Modellbahn-Rhein-Main (2-3 Buchstaben + Ziffern)
+    # Zuerst nach bekannten Praefixen suchen (zuverlaessiger)
+    known_prefixes = r'(?:KAD|SRT|JB|THE|SAL|THX|SCT|KU|1GW|FAE|DBA)'
+    priority_matches = re.findall(rf'\b({known_prefixes}\d{{1,6}})\b', text, re.IGNORECASE)
+
+    # Dann allgemeinere Suche (2-3 Grossbuchstaben + Ziffern, aber strenger)
+    general_matches = re.findall(r'\b([A-Z]{2,3}\d{2,6})\b', text)
+
+    all_matches = priority_matches + general_matches
+
     # Duplikate entfernen, Reihenfolge beibehalten
     seen = set()
     skus = []
-    for m in matches:
+    for m in all_matches:
         upper = m.upper()
         if upper not in seen:
             seen.add(upper)
             skus.append(upper)
-    # Typische Nicht-SKUs herausfiltern
-    ignore = {"HTML", "HTTP", "HTTPS", "UTF8", "EUR", "USD", "IMAP", "SMTP", "PDF", "CSS", "API"}
-    skus = [s for s in skus if s not in ignore]
+
+    # Nicht-SKUs herausfiltern (System-Begriffe, eBay-IDs, etc.)
+    ignore = {"HTML", "HTTP", "HTTPS", "UTF8", "EUR", "USD", "IMAP", "SMTP", "PDF",
+              "CSS", "API", "XML", "OVP", "DB", "AC", "DC", "BR", "ICE", "TGV",
+              "RE", "IC", "EC", "HO", "TT", "EBAY", "DHL", "GLS", "DPD", "UPS"}
+    # Auch zu lange oder zu kurze Codes filtern
+    skus = [s for s in skus if s not in ignore and 3 <= len(s) <= 10]
     return skus[:5]  # Maximal 5 SKUs
 
 
@@ -834,7 +849,7 @@ def send_long_telegram_text(text, reply_markup=None):
             send_telegram_text(part)
 
 
-def send_approval_request(token, sender, subject, body, draft, channel, order_context, images, category, translation_customer=None, translation_draft=None):
+def send_approval_request(token, sender, subject, body, draft, channel, order_context, images, category, translation_customer=None, translation_draft=None, ebay_item_id=None):
     lines        = draft.split("\n")
     mail_body    = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
     kanal        = "🏪 eBay" if channel == "ebay" else "🛒 Shop"
@@ -855,8 +870,15 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
     msg = (
         f"{kanal} {cat_icon} <b>{category.upper()}</b>\n"
         f"Von: <code>{sender}</code>\n"
-        f"Betreff: {subject}\n\n"
-        f"<b>Kunden-Nachricht:</b>\n"
+        f"Betreff: {subject}\n"
+    )
+
+    # eBay Artikel-Link anzeigen falls vorhanden
+    if ebay_item_id and channel == "ebay":
+        msg += f"🔗 <a href=\"https://www.ebay.de/itm/{ebay_item_id}\">eBay Angebot #{ebay_item_id}</a>\n"
+
+    msg += (
+        f"\n<b>Kunden-Nachricht:</b>\n"
         f"--------------------\n"
         f"{full_body}\n"
         f"--------------------"
@@ -1047,7 +1069,7 @@ def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_fi
         log.warning(f"Gesendet-Ordner: {e} (Mail wurde trotzdem gesendet)")
 
 
-def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None):
+def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None, ebay_item_id=None, ebay_recipient=None):
     token = hashlib.md5(f"{sender}{subject}{body[:50]}".encode()).hexdigest()[:8]
     if token in pending:
         return
@@ -1118,6 +1140,8 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
         "sender": sender_email, "subject": subject, "body": body,
         "draft": draft, "channel": channel, "category": category,
         "ebay_thread_id": ebay_thread_id,
+        "ebay_item_id": ebay_item_id,
+        "ebay_recipient": ebay_recipient,
         "order_id": order_data.get("order_id") if order_data else None,
         "order_context": context, "images": images or [],
         "translation_customer": translation_customer,
@@ -1125,7 +1149,8 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
     }
     send_approval_request(
         token, sender_email, subject, body, draft, channel, context,
-        images or [], category, translation_customer, translation_draft
+        images or [], category, translation_customer, translation_draft,
+        ebay_item_id=ebay_item_id
     )
     log.info(f"Entwurf gesendet fuer {sender_email} (Token: {token}, Kategorie: {category})")
 
@@ -1191,7 +1216,11 @@ def handle_telegram_update(update):
 
             # eBay-Nachrichten ueber eBay API beantworten, Shop-Mails per Brevo
             if p.get("channel") == "ebay" and p.get("ebay_thread_id") and EBAY_ENABLED:
-                ok = ebay_send_reply(p["ebay_thread_id"], body)
+                ok = ebay_send_reply(
+                    p["ebay_thread_id"], body,
+                    recipient=p.get("ebay_recipient"),
+                    item_id=p.get("ebay_item_id")
+                )
                 channel_label = "eBay"
             else:
                 # Bei Rechnungsanfragen: PDF automatisch anhaengen
@@ -1282,7 +1311,8 @@ def handle_telegram_update(update):
                     new_draft, p["channel"], p["order_context"], p["images"],
                     p.get("category", "unbekannt"),
                     p.get("translation_customer"),
-                    translation_draft or p.get("translation_draft")
+                    translation_draft or p.get("translation_draft"),
+                    ebay_item_id=p.get("ebay_item_id")
                 )
                 break
 
@@ -1450,7 +1480,8 @@ def ebay_check_messages():
                 log.info(f"eBay Nachricht von {sender}: {subject}")
                 process_mail(
                     full_subject, sender, body,
-                    channel="ebay", ebay_thread_id=ext_id
+                    channel="ebay", ebay_thread_id=ext_id,
+                    ebay_item_id=item_id, ebay_recipient=sender
                 )
                 ebay_processed_ids.add(msg_id)
 
@@ -1460,7 +1491,7 @@ def ebay_check_messages():
         log.warning(f"eBay Messages: {e}")
 
 
-def ebay_send_reply(inquiry_id, message_text):
+def ebay_send_reply(inquiry_id, message_text, recipient=None, item_id=None):
     """Antwort ueber eBay Trading API zurueckschicken (AddMemberMessageRTQ)."""
     if not EBAY_ENABLED:
         return False
@@ -1480,13 +1511,19 @@ def ebay_send_reply(inquiry_id, message_text):
         # HTML-Sonderzeichen escapen
         safe_text = message_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
+        # Empfaenger und Artikel-ID einbauen
+        recipient_xml = f"<RecipientID>{recipient}</RecipientID>" if recipient else ""
+        item_xml = f"<ItemID>{item_id}</ItemID>" if item_id else ""
+
         xml_request = f"""<?xml version="1.0" encoding="utf-8"?>
 <AddMemberMessageRTQRequest xmlns="urn:ebay:apis:eBLBaseComponents">
     <RequesterCredentials>
         <eBayAuthToken>{token}</eBayAuthToken>
     </RequesterCredentials>
+    {item_xml}
     <MemberMessage>
         <Body>{safe_text}</Body>
+        {recipient_xml}
         <ParentMessageID>{inquiry_id}</ParentMessageID>
     </MemberMessage>
 </AddMemberMessageRTQRequest>"""
@@ -1499,10 +1536,10 @@ def ebay_send_reply(inquiry_id, message_text):
         )
 
         if r.status_code == 200 and "<Ack>Success</Ack>" in r.text:
-            log.info(f"eBay Antwort gesendet (Message: {inquiry_id})")
+            log.info(f"eBay Antwort gesendet an {recipient} (Message: {inquiry_id})")
             return True
         elif r.status_code == 200 and "<Ack>Warning</Ack>" in r.text:
-            log.info(f"eBay Antwort gesendet mit Warnung (Message: {inquiry_id})")
+            log.info(f"eBay Antwort gesendet mit Warnung an {recipient} (Message: {inquiry_id})")
             return True
         else:
             error_match = re.search(r'<LongMessage>(.*?)</LongMessage>', r.text)
