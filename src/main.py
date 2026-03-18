@@ -1604,15 +1604,20 @@ def ebay_check_messages():
 
             sender = sender_match.group(1) if sender_match else "eBay-Kaeufer"
             subject = subject_match.group(1) if subject_match else "eBay Nachricht"
-            body = body_match.group(1) if body_match else ""
+            raw_body = body_match.group(1) if body_match else ""
             item_id = item_match.group(1) if item_match else ""
             ext_id = ext_msg_id_match.group(1) if ext_msg_id_match else msg_id
 
-            # HTML aus Body entfernen falls vorhanden
-            body = re.sub(r'<[^>]+>', ' ', body)
-            body = body.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-            body = body.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&apos;', "'")
-            body = re.sub(r'\s+', ' ', body).strip()
+            # HTML aus Body entfernen - nutze die html_to_text Funktion fuer komplettes HTML
+            if raw_body.strip().startswith("<!") or raw_body.strip().startswith("<html") or "<body" in raw_body.lower():
+                # Vollstaendiges HTML-Dokument -> html_to_text verwenden
+                body = html_to_text(raw_body)
+            else:
+                # Einfache HTML-Tags entfernen
+                body = re.sub(r'<[^>]+>', ' ', raw_body)
+                body = body.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+                body = body.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&apos;', "'")
+                body = re.sub(r'\s+', ' ', body).strip()
 
             # Auch Subject bereinigen
             subject = subject.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
