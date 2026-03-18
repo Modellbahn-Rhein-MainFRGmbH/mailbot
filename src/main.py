@@ -992,8 +992,8 @@ def fetch_invoice_pdf(order_id):
     return None
 
 
-def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
-    """Mail senden ueber Brevo HTTP API, optional mit PDF-Anhang."""
+def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None, in_reply_to=None, references=None):
+    """Mail senden ueber Brevo HTTP API, optional mit PDF-Anhang und Threading-Headers."""
     import base64
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
@@ -1007,6 +1007,18 @@ def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
         "textContent": full_body,
         "replyTo": {"email": MAIL_USER}
     }
+
+    # Threading-Headers fuer Mail-Verlauf (In-Reply-To / References)
+    if in_reply_to:
+        # Brevo unterstuetzt custom headers
+        mail_headers = {}
+        mail_headers["In-Reply-To"] = in_reply_to
+        if references:
+            mail_headers["References"] = f"{references} {in_reply_to}"
+        else:
+            mail_headers["References"] = in_reply_to
+        payload["headers"] = mail_headers
+        log.info(f"Mail-Threading: In-Reply-To {in_reply_to[:50]}...")
 
     # PDF-Anhang hinzufuegen falls vorhanden
     if pdf_attachment and pdf_filename:
@@ -1032,8 +1044,8 @@ def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
         if r.status_code in (200, 201):
             log.info(f"Mail gesendet an {to_addr}: {subject}")
 
-            # Kopie in Gesendet-Ordner ablegen
-            save_to_sent_folder(to_addr, subject, full_body, pdf_attachment, pdf_filename)
+            # Kopie in Gesendet-Ordner ablegen (mit Threading)
+            save_to_sent_folder(to_addr, subject, full_body, pdf_attachment, pdf_filename, in_reply_to, references)
 
             return True
         else:
@@ -1044,8 +1056,8 @@ def send_mail(to_addr, subject, body, pdf_attachment=None, pdf_filename=None):
         return False
 
 
-def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_filename=None):
-    """Gesendete Mail per IMAP im Gesendet-Ordner ablegen."""
+def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_filename=None, in_reply_to=None, references=None):
+    """Gesendete Mail per IMAP im Gesendet-Ordner ablegen (mit Threading-Headers)."""
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
     from email.mime.application import MIMEApplication
@@ -1066,6 +1078,14 @@ def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_fi
         msg["From"]    = f"Modellbahn-Rhein-Main <{MAIL_USER}>"
         msg["To"]      = to_addr
         msg["Date"]    = formatdate(localtime=True)
+
+        # Threading-Headers fuer Mail-Verlauf
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            if references:
+                msg["References"] = f"{references} {in_reply_to}"
+            else:
+                msg["References"] = in_reply_to
 
         # Per IMAP in Gesendet-Ordner ablegen
         with imaplib.IMAP4_SSL(MAIL_HOST) as imap:
@@ -1108,7 +1128,7 @@ def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_fi
         log.warning(f"Gesendet-Ordner: {e} (Mail wurde trotzdem gesendet)")
 
 
-def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None, ebay_item_id=None, ebay_recipient=None):
+def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None, ebay_item_id=None, ebay_recipient=None, original_message_id=None, original_references=None):
     token = hashlib.md5(f"{sender}{subject}{body[:50]}".encode()).hexdigest()[:8]
     if token in pending:
         return
@@ -1185,6 +1205,8 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
         "order_context": context, "images": images or [],
         "translation_customer": translation_customer,
         "translation_draft": translation_draft,
+        "original_message_id": original_message_id,
+        "original_references": original_references,
         "telegram_msg_ids": []
     }
     tg_msg_ids = send_approval_request(
@@ -1223,8 +1245,14 @@ def check_inbox():
                     log.info(f"eBay-Mail ignoriert: {subject}")
                     continue
 
+                # Message-ID und References fuer Threading speichern
+                original_message_id = msg.get("Message-ID", "")
+                original_references = msg.get("References", "")
+
                 body, images = get_mail_body_and_images(msg)
-                process_mail(subject, sender, body, channel="shop", images=images)
+                process_mail(subject, sender, body, channel="shop", images=images,
+                            original_message_id=original_message_id,
+                            original_references=original_references)
     except Exception as e:
         log.error(f"IMAP: {e}")
 
@@ -1279,7 +1307,10 @@ def handle_telegram_update(update):
                     else:
                         send_telegram_text(f"⚠️ Keine Rechnung für #{order_id} gefunden. Mail wird ohne Anhang gesendet.")
 
-                ok = send_mail(p["sender"], subj, body, pdf_attachment=pdf_data, pdf_filename=pdf_name)
+                ok = send_mail(p["sender"], subj, body,
+                              pdf_attachment=pdf_data, pdf_filename=pdf_name,
+                              in_reply_to=p.get("original_message_id"),
+                              references=p.get("original_references"))
                 channel_label = "Mail" + (" + Rechnung" if pdf_data else "")
 
             del pending[token]
