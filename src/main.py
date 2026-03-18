@@ -777,18 +777,38 @@ def send_telegram_text(text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error(f"Telegram: {e}")
+    return None
 
 
 def send_telegram_photo(image_data, caption=""):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
     try:
-        requests.post(url, files={"photo": ("image.jpg", image_data, "image/jpeg")},
+        r = requests.post(url, files={"photo": ("image.jpg", image_data, "image/jpeg")},
                       data={"chat_id": TG_CHAT_ID, "caption": caption}, timeout=15)
+        if r.status_code == 200:
+            return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error(f"Telegram Foto: {e}")
+    return None
+
+
+def delete_telegram_messages(message_ids):
+    """Loesche mehrere Telegram-Nachrichten."""
+    for msg_id in message_ids:
+        if msg_id:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/deleteMessage",
+                    json={"chat_id": TG_CHAT_ID, "message_id": msg_id},
+                    timeout=5
+                )
+            except:
+                pass
 
 
 def detect_language(text):
@@ -823,19 +843,20 @@ def translate_to_german(text, label="Text"):
 
 
 def send_long_telegram_text(text, reply_markup=None):
-    """Telegram-Nachricht senden, bei Bedarf in mehrere Teile aufgeteilt (Limit: 4096 Zeichen)."""
-    MAX_LEN = 4000  # Etwas unter 4096 fuer Sicherheit
+    """Telegram-Nachricht senden, bei Bedarf in mehrere Teile aufgeteilt. Gibt Liste der Message-IDs zurueck."""
+    MAX_LEN = 4000
+    msg_ids = []
     if len(text) <= MAX_LEN:
-        send_telegram_text(text, reply_markup)
-        return
+        mid = send_telegram_text(text, reply_markup)
+        if mid:
+            msg_ids.append(mid)
+        return msg_ids
 
-    # Text in Teile aufsplitten
     parts = []
     while text:
         if len(text) <= MAX_LEN:
             parts.append(text)
             break
-        # Am letzten Zeilenumbruch vor dem Limit trennen
         split_pos = text.rfind("\n", 0, MAX_LEN)
         if split_pos < MAX_LEN // 2:
             split_pos = MAX_LEN
@@ -844,9 +865,12 @@ def send_long_telegram_text(text, reply_markup=None):
 
     for i, part in enumerate(parts):
         if i == len(parts) - 1 and reply_markup:
-            send_telegram_text(part, reply_markup)
+            mid = send_telegram_text(part, reply_markup)
         else:
-            send_telegram_text(part)
+            mid = send_telegram_text(part)
+        if mid:
+            msg_ids.append(mid)
+    return msg_ids
 
 
 def send_approval_request(token, sender, subject, body, draft, channel, order_context, images, category, translation_customer=None, translation_draft=None, ebay_item_id=None):
@@ -915,9 +939,12 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
          {"text": "✏️ Aendern",    "callback_data": f"edit:{token}"}],
         [{"text": "🗑️ Ignorieren", "callback_data": f"ignore:{token}"}]
     ]}
-    send_long_telegram_text(msg, keyboard)
+    msg_ids = send_long_telegram_text(msg, keyboard)
     for i, img in enumerate(images):
-        send_telegram_photo(img, f"📷 Bild {i+1} von {len(images)}")
+        mid = send_telegram_photo(img, f"📷 Bild {i+1} von {len(images)}")
+        if mid:
+            msg_ids.append(mid)
+    return msg_ids
 
 
 def fetch_invoice_pdf(order_id):
@@ -1145,13 +1172,15 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
         "order_id": order_data.get("order_id") if order_data else None,
         "order_context": context, "images": images or [],
         "translation_customer": translation_customer,
-        "translation_draft": translation_draft
+        "translation_draft": translation_draft,
+        "telegram_msg_ids": []
     }
-    send_approval_request(
+    tg_msg_ids = send_approval_request(
         token, sender_email, subject, body, draft, channel, context,
         images or [], category, translation_customer, translation_draft,
         ebay_item_id=ebay_item_id
     )
+    pending[token]["telegram_msg_ids"] = tg_msg_ids or []
     log.info(f"Entwurf gesendet fuer {sender_email} (Token: {token}, Kategorie: {category})")
 
 
@@ -1246,6 +1275,8 @@ def handle_telegram_update(update):
                 send_telegram_text(f"✅ {channel_label} an <code>{p['sender']}</code> gesendet!")
             else:
                 send_telegram_text(f"⚠️ Fehler! Bitte manuell antworten an {p['sender']}")
+            # Alte Nachrichten aus Telegram loeschen
+            delete_telegram_messages(p.get("telegram_msg_ids", []))
         elif action == "edit":
             pending[token]["awaiting_edit"] = True
             send_telegram_text(
@@ -1258,8 +1289,11 @@ def handle_telegram_update(update):
                 f"Token: <code>{token}</code>"
             )
         elif action == "ignore":
+            tg_ids = p.get("telegram_msg_ids", [])
             del pending[token]
             send_telegram_text("🗑️ Vorgang ignoriert.")
+            # Alte Nachrichten aus Telegram loeschen
+            delete_telegram_messages(tg_ids)
 
     elif "message" in update:
         text = update["message"].get("text", "")
@@ -1306,7 +1340,10 @@ def handle_telegram_update(update):
                     translation_draft = translate_to_german(draft_text, "Antwort-Entwurf")
                     pending[token]["translation_draft"] = translation_draft
 
-                send_approval_request(
+                # Alte Telegram-Nachrichten loeschen
+                delete_telegram_messages(p.get("telegram_msg_ids", []))
+
+                new_tg_ids = send_approval_request(
                     token, p["sender"], p["subject"], p["body"],
                     new_draft, p["channel"], p["order_context"], p["images"],
                     p.get("category", "unbekannt"),
@@ -1314,6 +1351,7 @@ def handle_telegram_update(update):
                     translation_draft or p.get("translation_draft"),
                     ebay_item_id=p.get("ebay_item_id")
                 )
+                pending[token]["telegram_msg_ids"] = new_tg_ids or []
                 break
 
 
