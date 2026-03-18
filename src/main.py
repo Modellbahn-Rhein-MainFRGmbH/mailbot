@@ -792,6 +792,14 @@ def send_telegram_text(text, reply_markup=None):
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
             return r.json().get("result", {}).get("message_id")
+        else:
+            log.error(f"Telegram Fehler {r.status_code}: {r.text[:200]}")
+            # Fallback: Ohne HTML-Parsing nochmal versuchen
+            payload["parse_mode"] = ""
+            r2 = requests.post(url, json=payload, timeout=10)
+            if r2.status_code == 200:
+                log.info("Telegram: Fallback ohne HTML erfolgreich")
+                return r2.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error(f"Telegram: {e}")
     return None
@@ -898,15 +906,21 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
     }
     cat_icon = cat_emoji.get(category, "📧")
 
-    # VOLLSTAENDIGER Body - kein Kuerzen mehr!
-    full_body = body.strip()
-    ctx_display = order_context
+    # HTML-Sonderzeichen escapen damit Telegram nicht abbricht
+    def tg_escape(text):
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # VOLLSTAENDIGER Body - kein Kuerzen mehr! Aber HTML-safe machen
+    full_body = tg_escape(body.strip())
+    safe_subject = tg_escape(subject)
+    safe_mail_body = tg_escape(mail_body)
+    ctx_display = tg_escape(order_context)
 
     # Nachricht zusammenbauen
     msg = (
         f"{kanal} {cat_icon} <b>{category.upper()}</b>\n"
-        f"Von: <code>{sender}</code>\n"
-        f"Betreff: {subject}\n"
+        f"Von: <code>{tg_escape(sender)}</code>\n"
+        f"Betreff: {safe_subject}\n"
     )
 
     # eBay Artikel-Link anzeigen falls vorhanden
@@ -925,7 +939,7 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
         msg += (
             f"\n\n🌐 <b>Deutsche Übersetzung (Kunden-Nachricht):</b>\n"
             f"--------------------\n"
-            f"{translation_customer}\n"
+            f"{tg_escape(translation_customer)}\n"
             f"--------------------"
         )
 
@@ -933,7 +947,7 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
         f"\n\n<b>Bestelldaten:</b>\n<code>{ctx_display}</code>\n\n"
         f"<b>Mein Vorschlag:</b>\n"
         f"--------------------\n"
-        f"{mail_body}\n"
+        f"{safe_mail_body}\n"
         f"--------------------"
     )
 
@@ -942,7 +956,7 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
         msg += (
             f"\n\n🌐 <b>Deutsche Übersetzung (Antwort):</b>\n"
             f"--------------------\n"
-            f"{translation_draft}\n"
+            f"{tg_escape(translation_draft)}\n"
             f"--------------------"
         )
 
