@@ -788,6 +788,8 @@ def generate_draft(subject, body, sender, channel, context, category):
         max_tokens=1500,
         system=full_system,
         messages=[{"role": "user", "content": (
+            f"AKTUELLES DATUM: {datetime.now().strftime('%A, %d. %B %Y')} (Wochentag auf Deutsch: {['Montag','Dienstag','Mittwoch','Donnerstag','Freitag','Samstag','Sonntag'][datetime.now().weekday()]})\n"
+            f"AKTUELLE UHRZEIT: {datetime.now().strftime('%H:%M')} Uhr\n\n"
             f"Kanal: {channel_hint}\n"
             f"Kategorie: {category}\n"
             f"Absender: {sender}\n"
@@ -797,6 +799,7 @@ def generate_draft(subject, body, sender, channel, context, category):
             f"WICHTIG: Falls die Nachricht einen Mail-Verlauf enthaelt (zitierte fruehere Nachrichten), "
             f"beruecksichtige den GESAMTEN Kontext der bisherigen Konversation fuer deine Antwort. "
             f"Antworte nur auf die NEUESTE Nachricht des Kunden, aber mit Wissen ueber den gesamten Verlauf.\n\n"
+            f"WICHTIG: Wenn der Kunde 'morgen', 'uebermorgen', 'Freitag' etc. schreibt, berechne das korrekte Datum basierend auf dem AKTUELLEN DATUM oben.\n\n"
             f"Erstelle die fertige Antwort. Beachte die kategorie-spezifischen Anweisungen fuer '{category}'.\n"
             f"Erste Zeile: BETREFF: Re: {subject}"
         )}]
@@ -1426,7 +1429,7 @@ def handle_telegram_update(update):
                 else:
                     daily_stats["shop_answered"] += 1
 
-                # Termin erkennen und ICS-Datei senden
+                # Termin erkennen und ICS-Datei + Google Calendar Link senden
                 termin = extract_termin_from_draft(p.get("draft", ""))
                 if termin:
                     ics = create_ics_file(termin)
@@ -1434,6 +1437,20 @@ def handle_telegram_update(update):
                     send_telegram_document(
                         ics, filename,
                         f"📅 Termin: {termin['typ']} mit {termin['kunde']} am {termin['date']} um {termin['time']} Uhr"
+                    )
+
+                    # Google Calendar Link als Alternative (funktioniert immer)
+                    from datetime import datetime as dt, timedelta
+                    start = dt.strptime(f"{termin['date']} {termin['time']}", "%Y-%m-%d %H:%M")
+                    end = start + timedelta(minutes=30)
+                    gcal_start = start.strftime("%Y%m%dT%H%M%S")
+                    gcal_end = end.strftime("%Y%m%dT%H%M%S")
+                    gcal_title = f"{termin['typ']} - {termin['kunde']}".replace(" ", "+")
+                    gcal_location = "Max-Planck-Str.+18,+63322+Rödermark"
+                    gcal_url = f"https://calendar.google.com/calendar/render?action=TEMPLATE&text={gcal_title}&dates={gcal_start}/{gcal_end}&location={gcal_location}&ctz=Europe/Berlin"
+                    send_telegram_text(
+                        f"📅 <b>Alternativ direkt im Browser hinzufügen:</b>\n"
+                        f"<a href=\"{gcal_url}\">➕ Google Kalender</a>"
                     )
             else:
                 send_telegram_text(f"⚠️ Fehler! Bitte manuell antworten an {p['sender']}")
@@ -1655,7 +1672,7 @@ def create_ics_file(termin_data):
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
+        "METHOD:REQUEST",
         "PRODID:-//Modellbahn-Rhein-Main//Mailbot//DE",
         "BEGIN:VTIMEZONE",
         "TZID:Europe/Berlin",
@@ -1700,12 +1717,14 @@ def send_telegram_document(file_content, filename, caption=""):
     """Sende ein Dokument (z.B. ICS-Datei) per Telegram."""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
     try:
-        # ICS als Bytes mit korrektem MIME-Type senden
         file_bytes = file_content.encode("utf-8") if isinstance(file_content, str) else file_content
+
+        # Versuche verschiedene MIME-Types fuer beste iOS-Kompatibilitaet
+        # text/calendar ist der offizielle Standard
         r = requests.post(
             url,
-            files={"document": (filename, file_bytes, "application/ics")},
-            data={"chat_id": TG_CHAT_ID, "caption": caption},
+            files={"document": (filename, file_bytes, "text/calendar")},
+            data={"chat_id": TG_CHAT_ID, "caption": caption + "\n\n💡 Tipp: Datei antippen → Teilen (↗️) → 'In Kalender kopieren' oder direkt in Dateien speichern und von dort öffnen."},
             timeout=15
         )
         if r.status_code == 200:
