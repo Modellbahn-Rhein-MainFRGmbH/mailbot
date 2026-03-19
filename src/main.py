@@ -1157,7 +1157,7 @@ def save_to_sent_folder(to_addr, subject, full_body, pdf_attachment=None, pdf_fi
         log.warning(f"Gesendet-Ordner: {e} (Mail wurde trotzdem gesendet)")
 
 
-def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None, ebay_item_id=None, ebay_recipient=None, original_message_id=None, original_references=None, imap_uid=None):
+def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, images=None, ebay_item_id=None, ebay_recipient=None, original_message_id=None, original_references=None, imap_uid=None, ebay_msg_id_for_flag=None):
     token = hashlib.md5(f"{sender}{subject}{body[:50]}".encode()).hexdigest()[:8]
     if token in pending:
         return
@@ -1237,6 +1237,7 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
         "original_message_id": original_message_id,
         "original_references": original_references,
         "imap_uid": imap_uid,
+        "ebay_msg_id_for_flag": ebay_msg_id_for_flag,
         "telegram_msg_ids": []
     }
     tg_msg_ids = send_approval_request(
@@ -1352,6 +1353,9 @@ def handle_telegram_update(update):
                 # Mail als gelesen + beantwortet markieren (Antwort-Pfeil in Apple Mail)
                 mark_mail_as_seen(p.get("imap_uid"))
                 mark_mail_as_answered(p.get("imap_uid"))
+                # eBay-Nachricht als beantwortet markieren (Flagged-Häkchen im eBay-Portal)
+                if p.get("ebay_msg_id_for_flag"):
+                    ebay_mark_as_flagged(p["ebay_msg_id_for_flag"])
                 # Statistik
                 reset_daily_stats_if_needed()
                 daily_stats["answered"] += 1
@@ -1819,49 +1823,151 @@ def ebay_check_messages():
             body_match = re.search(r'<Text>(.*?)</Text>', detail_text, re.DOTALL)
             item_match = re.search(r'<ItemID>(.*?)</ItemID>', detail_text)
             ext_msg_id_match = re.search(r'<ExternalMessageID>(.*?)</ExternalMessageID>', detail_text)
-            # Auch ResponseDetails/MessageType pruefen ob es eine eingehende Nachricht ist
             msg_type_match = re.search(r'<MessageType>(.*?)</MessageType>', detail_text)
-            is_question = not msg_type_match or msg_type_match.group(1) != "AskSellerQuestion"
 
-            sender = sender_match.group(1) if sender_match else "eBay-Kaeufer"
+            sender = sender_match.group(1) if sender_match else ""
             subject = subject_match.group(1) if subject_match else "eBay Nachricht"
             raw_body = body_match.group(1) if body_match else ""
             item_id = item_match.group(1) if item_match else ""
             ext_id = ext_msg_id_match.group(1) if ext_msg_id_match else msg_id
+            msg_type = msg_type_match.group(1) if msg_type_match else ""
 
-            # HTML aus Body entfernen - nutze die html_to_text Funktion fuer komplettes HTML
+            # === FILTER: Nur echte Kaeufer-Nachrichten durchlassen ===
+
+            # eBay System-Absender ignorieren
+            ebay_system_senders = ["ebay", "ebay kundenservice", "ebay customer service",
+                                   "ebay.de", "ebay.com", "members.ebay"]
+            if sender.lower() in ebay_system_senders or not sender:
+                log.info(f"eBay System-Nachricht ignoriert von '{sender}': {subject[:80]}")
+                ebay_mark_as_read(token, msg_id, headers_xml)
+                continue
+
+            # eBay System-Betreff-Muster ignorieren
+            system_subjects = [
+                "ruecksendung", "rücksendung", "rückerstattung", "rueckerstattung",
+                "erstattung", "refund", "return",
+                "auszahlung", "zahlung eingegangen", "payment",
+                "bewertung", "feedback", "review",
+                "angebot läuft", "angebot lauft", "listing",
+                "rechnung", "invoice",
+                "versanddetails", "shipping",
+                "erinnerung", "reminder",
+                "ihr konto", "your account",
+                "promotion", "angebot für sie", "special offer",
+                "verkaufsaktion", "sales event",
+                "wichtige information", "important information",
+                "richtlinien", "policy", "policies",
+                "verifizierung", "verification"
+            ]
+            subject_lower = subject.lower()
+            is_system = any(kw in subject_lower for kw in system_subjects)
+
+            # MessageType pruefen - nur AskSellerQuestion und andere Kaeufer-Typen durchlassen
+            buyer_msg_types = ["AskSellerQuestion", "ResponseToASQQuestion", "ContactEbayMember",
+                              "ContacteBayMemberViaCommunityLink", ""]
+            if msg_type and msg_type not in buyer_msg_types:
+                is_system = True
+
+            if is_system:
+                log.info(f"eBay System-Nachricht ignoriert: {subject[:80]} (Typ: {msg_type})")
+                ebay_mark_as_read(token, msg_id, headers_xml)
+                continue
+
+            # === FILTER BESTANDEN: Echte Kaeufer-Nachricht ===
+
+            # HTML aus Body entfernen
             if raw_body.strip().startswith("<!") or raw_body.strip().startswith("<html") or "<body" in raw_body.lower():
-                # Vollstaendiges HTML-Dokument -> html_to_text verwenden
                 body = html_to_text(raw_body)
             else:
-                # Einfache HTML-Tags entfernen
                 body = re.sub(r'<[^>]+>', ' ', raw_body)
                 body = body.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
                 body = body.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&apos;', "'")
                 body = re.sub(r'\s+', ' ', body).strip()
+
+            # Body nochmal bereinigen: Nur den eigentlichen Nachrichtentext behalten
+            # eBay fuegt oft viel Boilerplate hinzu - versuche den Kern zu extrahieren
+            if body:
+                # Typische eBay-Boilerplate am Ende entfernen
+                boilerplate_markers = [
+                    "Diese Nachricht wurde von eBay",
+                    "This message was sent from eBay",
+                    "Antworten Sie nicht auf diese E-Mail",
+                    "Do not reply to this email",
+                    "Marketplace-Nachrichten",
+                    "Copyright eBay",
+                    "eBay International AG",
+                    "Datenschutzrichtlinie",
+                    "Privacy Policy",
+                    "Klicken Sie hier, um diese Nachricht",
+                    "Click here to respond",
+                    "Weitere Informationen finden Sie",
+                    "eBay-Kaufabwicklung",
+                    "Um mehr zu erfahren",
+                    "Learn more about"
+                ]
+                for marker in boilerplate_markers:
+                    pos = body.find(marker)
+                    if pos > 20:  # Nicht am Anfang abschneiden
+                        body = body[:pos].strip()
+                        break
 
             # Auch Subject bereinigen
             subject = subject.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
             subject = subject.replace('&quot;', '"').replace('&apos;', "'")
 
             if sender:
-                # eBay-Artikel-ID im Betreff markieren (aber NICHT als Bestellnummer verwenden)
                 full_subject = f"[eBay] {subject}"
                 if item_id:
                     full_subject += f" (Artikel: {item_id})"
 
-                # Body kann leer sein bei manchen eBay-Nachrichten - trotzdem weiterleiten
                 if not body:
                     body = f"(Kunde hat eine Nachricht zu Artikel {item_id} gesendet, aber kein Text enthalten. Betreff: {subject})"
 
-                log.info(f"eBay Nachricht von {sender}: {subject} | Body: {body[:100]}")
+                log.info(f"eBay Kaeufer-Nachricht von {sender}: {subject} | Body: {body[:100]}")
+
+                # Vorherige Nachrichten im Thread extrahieren (Konversationshistorie)
+                prev_messages = re.findall(r'<ResponseDetails>(.*?)</ResponseDetails>', detail_text, re.DOTALL)
+                conversation_history = ""
+                if prev_messages:
+                    history_parts = []
+                    for prev in prev_messages:
+                        prev_sender_m = re.search(r'<SenderLoginName>(.*?)</SenderLoginName>', prev)
+                        prev_body_m = re.search(r'<ResponseText>(.*?)</ResponseText>', prev, re.DOTALL)
+                        prev_date_m = re.search(r'<CreationDate>(.*?)</CreationDate>', prev)
+                        if prev_body_m:
+                            prev_sender_name = prev_sender_m.group(1) if prev_sender_m else "Unbekannt"
+                            prev_body_text = prev_body_m.group(1)
+                            if "<" in prev_body_text:
+                                prev_body_text = html_to_text(prev_body_text)
+                            prev_date = prev_date_m.group(1)[:10] if prev_date_m else ""
+                            history_parts.append(f"[{prev_date} {prev_sender_name}]: {prev_body_text.strip()}")
+                    if history_parts:
+                        conversation_history = "\n\n--- Bisheriger Verlauf ---\n" + "\n\n".join(history_parts)
+
+                # Bilder aus der eBay-Nachricht extrahieren
+                ebay_images = []
+                img_urls = re.findall(r'<MessageMediaURL>(.*?)</MessageMediaURL>', detail_text)
+                for img_url in img_urls[:3]:  # Max 3 Bilder
+                    try:
+                        img_r = requests.get(img_url, timeout=10)
+                        if img_r.status_code == 200 and img_r.headers.get("Content-Type", "").startswith("image"):
+                            ebay_images.append(img_r.content)
+                            log.info(f"eBay Bild heruntergeladen: {img_url[:60]}...")
+                    except Exception as e:
+                        log.warning(f"eBay Bild laden: {e}")
+
+                # Vollstaendigen Body mit Verlauf zusammenbauen
+                full_body_with_history = body + conversation_history
+
                 process_mail(
-                    full_subject, sender, body,
+                    full_subject, sender, full_body_with_history,
                     channel="ebay", ebay_thread_id=ext_id,
-                    ebay_item_id=item_id, ebay_recipient=sender
+                    ebay_item_id=item_id, ebay_recipient=sender,
+                    images=ebay_images if ebay_images else None,
+                    ebay_msg_id_for_flag=msg_id
                 )
 
-                # Nachricht bei eBay als gelesen markieren (damit sie nicht nochmal kommt)
+                # Nachricht bei eBay als gelesen markieren
                 ebay_mark_as_read(token, msg_id, headers_xml)
 
         log.info(f"eBay: {len(unread_ids)} ungelesene Nachrichten verarbeitet")
@@ -1899,6 +2005,47 @@ def ebay_mark_as_read(token, message_id, headers_xml):
             log.warning(f"eBay Nachricht als gelesen markieren fehlgeschlagen: {r.text[:100]}")
     except Exception as e:
         log.warning(f"eBay mark as read: {e}")
+
+
+def ebay_mark_as_flagged(message_id):
+    """Markiere eine eBay-Nachricht als beantwortet (Flagged) ueber ReviseMyMessages."""
+    if not EBAY_ENABLED:
+        return
+    token = ebay_get_access_token()
+    if not token:
+        return
+    try:
+        headers_xml = {
+            "X-EBAY-API-SITEID": "77",
+            "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
+            "X-EBAY-API-CALL-NAME": "ReviseMyMessages",
+            "X-EBAY-API-IAF-TOKEN": token,
+            "Content-Type": "text/xml"
+        }
+
+        xml_request = f"""<?xml version="1.0" encoding="utf-8"?>
+<ReviseMyMessagesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <RequesterCredentials>
+        <eBayAuthToken>{token}</eBayAuthToken>
+    </RequesterCredentials>
+    <MessageIDs>
+        <MessageID>{message_id}</MessageID>
+    </MessageIDs>
+    <Flagged>true</Flagged>
+</ReviseMyMessagesRequest>"""
+
+        r = requests.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=headers_xml,
+            data=xml_request.encode("utf-8"),
+            timeout=10
+        )
+        if r.status_code == 200 and "<Ack>Success</Ack>" in r.text:
+            log.info(f"eBay Nachricht als beantwortet markiert (Flagged)")
+        else:
+            log.warning(f"eBay Flagged fehlgeschlagen: {r.text[:100]}")
+    except Exception as e:
+        log.warning(f"eBay mark as flagged: {e}")
 
 
 def ebay_send_reply(inquiry_id, message_text, recipient=None, item_id=None):
