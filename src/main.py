@@ -34,9 +34,10 @@ WC_SECRET  = os.environ.get("WC_SECRET", "")
 SC_KEY     = os.environ.get("SC_KEY", "")
 SC_SECRET  = os.environ.get("SC_SECRET", "")
 
-# WordPress Application Password (fuer Rechnungs-PDF Download)
-WP_USER     = os.environ.get("WP_USER", "")
-WP_APP_PASS = os.environ.get("WP_APP_PASS", "")
+# WordPress (fuer Rechnungs-PDF Download)
+WP_USER       = os.environ.get("WP_USER", "")
+WP_APP_PASS   = os.environ.get("WP_APP_PASS", "")
+WP_LOGIN_PASS = os.environ.get("WP_LOGIN_PASS", "")
 
 # Telegram
 TG_TOKEN   = os.environ["TG_TOKEN"]
@@ -197,6 +198,12 @@ SAMMLUNG VERKAUFEN / ANKAUF:
 - Auch Sammlerstuecke und seltene Handarbeitsmodelle sind interessant.
 - Ueber das Ankaufformular auf der Website kann man ein unverbindliches Angebot einholen.
 - Faires Angebot auf Basis topaktueller Marktpreise dank eigener Datenbank.
+- WICHTIG ANKAUF: NIEMALS selbst Ankaufspreise nennen, schaetzen oder kalkulieren!
+  Fabian bewertet jedes Modell individuell anhand seiner eigenen Datenbank.
+  Stattdessen immer schreiben: "Ich schaue mir die Wagen/Modelle an und nenne Ihnen dann den Ankaufspreis."
+  oder: "Den genauen Ankaufspreis kann ich Ihnen nennen sobald ich die Modelle gesehen habe."
+  Bei bekannten laufenden Verhandlungen (z.B. im Mail-Verlauf steht schon ein Preis von Fabian): 
+  Auf Fabians genannten Preis verweisen, aber KEINE neuen Preise fuer weitere Modelle erfinden.
 
 KOMMENDE SAMMLUNGEN:
 - Auf unserer Website stehen unten auf jeder Seite die naechsten Sammlungen im Zulauf.
@@ -989,33 +996,88 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
 
 
 def fetch_invoice_pdf(order_id):
-    """Rechnungs-PDF von WordPress/German Market herunterladen."""
-    if not WP_USER or not WP_APP_PASS or not order_id:
+    """Rechnungs-PDF von WordPress/German Market herunterladen.
+    Methode: WordPress-Login per Cookie, Nonce holen, dann PDF downloaden."""
+    if not WP_USER or not order_id:
+        return None
+    if not WP_LOGIN_PASS and not WP_APP_PASS:
         return None
     try:
-        import base64
-        # WordPress Application Password Auth
-        credentials = base64.b64encode(f"{WP_USER}:{WP_APP_PASS}".encode()).decode()
+        import re as regex
 
-        # Zuerst brauchen wir einen gueltigen Nonce
-        # Wir nutzen den wp-admin AJAX Endpoint mit Basic Auth
         session = requests.Session()
-        session.headers.update({"Authorization": f"Basic {credentials}"})
+        login_password = WP_LOGIN_PASS or WP_APP_PASS
 
-        # Direkt den Invoice-Download Endpoint aufrufen
-        r = session.get(
-            f"{WC_URL}/wp-admin/admin-ajax.php",
-            params={
-                "action": "woocommerce_wp_wc_invoice_pdf_invoice_download",
-                "order_id": str(order_id)
+        # Schritt 1: WordPress Login per wp-login.php (Cookie-basiert)
+        login_r = session.post(
+            f"{WC_URL}/wp-login.php",
+            data={
+                "log": WP_USER,
+                "pwd": login_password,
+                "wp-submit": "Log In",
+                "redirect_to": f"{WC_URL}/wp-admin/",
+                "testcookie": "1"
             },
+            allow_redirects=True,
             timeout=30
         )
+
+        # Pruefen ob Login erfolgreich (Redirect zum Dashboard)
+        if "wp-admin" not in login_r.url and login_r.status_code != 200:
+            log.warning(f"WordPress Login fehlgeschlagen (Status: {login_r.status_code})")
+
+            # Fallback: Application Password als Basic Auth
+            import base64
+            credentials = base64.b64encode(f"{WP_USER}:{WP_APP_PASS}".encode()).decode()
+            session.headers.update({"Authorization": f"Basic {credentials}"})
+
+        # Schritt 2: Bestellseite laden um Nonce zu holen
+        order_page = session.get(
+            f"{WC_URL}/wp-admin/post.php",
+            params={"post": str(order_id), "action": "edit"},
+            timeout=30
+        )
+
+        if order_page.status_code != 200:
+            log.warning(f"Bestellseite nicht erreichbar (Status: {order_page.status_code})")
+            # Trotzdem versuchen ohne Nonce
+            nonce = ""
+        else:
+            # Nonce aus der Seite extrahieren
+            nonce_match = regex.search(r'_wpnonce["\s]*(?:value="|:)["\s]*([a-f0-9]+)', order_page.text)
+            if not nonce_match:
+                # Alternativer Nonce-Suche
+                nonce_match = regex.search(r'wp_nonce["\s]*(?:value="|:)["\s]*([a-f0-9]+)', order_page.text)
+            nonce = nonce_match.group(1) if nonce_match else ""
+            log.info(f"WordPress Nonce gefunden: {nonce[:10]}...")
+
+        # Schritt 3: Rechnungs-PDF herunterladen
+        params = {
+            "action": "woocommerce_wp_wc_invoice_pdf_invoice_download",
+            "order_id": str(order_id)
+        }
+        if nonce:
+            params["_wpnonce"] = nonce
+
+        r = session.get(
+            f"{WC_URL}/wp-admin/admin-ajax.php",
+            params=params,
+            timeout=30
+        )
+
         if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("application/pdf"):
             log.info(f"Rechnungs-PDF heruntergeladen fuer Bestellung #{order_id} ({len(r.content)} Bytes)")
             return r.content
+        elif r.status_code == 200 and len(r.content) > 1000:
+            # Manchmal kommt PDF ohne korrekten Content-Type
+            if r.content[:5] == b'%PDF-':
+                log.info(f"Rechnungs-PDF heruntergeladen (ohne Content-Type) fuer #{order_id} ({len(r.content)} Bytes)")
+                return r.content
+            else:
+                log.warning(f"Rechnungs-PDF: Unerwarteter Content fuer #{order_id} (Status: {r.status_code}, Type: {r.headers.get('Content-Type', 'unbekannt')})")
         else:
             log.warning(f"Rechnungs-PDF nicht verfuegbar fuer #{order_id} (Status: {r.status_code})")
+
     except Exception as e:
         log.warning(f"Rechnungs-PDF Fehler: {e}")
     return None
