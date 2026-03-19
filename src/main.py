@@ -253,6 +253,18 @@ Bei KONTAKTFORMULAR:
 - Falls eine Artikelnummer genannt wird: Nutze die ARTIKEL-INFORMATIONEN um Verfuegbarkeit und Preis zu nennen.
 - Beachte: Jeden Artikel haben wir nur einmal. "Auf Lager" = sofort bestellbar, schnell zugreifen. "Ausverkauft" = leider weg, auf Ankuendigungen verweisen.
 
+Bei TERMIN:
+- Kunde moechte einen Termin fuer Abholung oder Besichtigung/Beratung.
+- Adresse: Max-Planck-Str. 18, 63322 Roedermark.
+- Keine festen Oeffnungszeiten, nur nach Terminvereinbarung. Samstags NICHT moeglich.
+- Bei Terminbestaetigung: Datum und Uhrzeit klar nennen.
+- WICHTIG: Wenn ein konkretes Datum und Uhrzeit vereinbart wird, schreibe in der LETZTEN Zeile vor der Signatur:
+  TERMIN: YYYY-MM-DD HH:MM | Typ | Kundenname
+  Beispiel: TERMIN: 2026-03-20 14:00 | Abholung | Herr Mueller
+  Beispiel: TERMIN: 2026-03-22 10:30 | Besichtigung | Frau Schmidt
+  Diese Zeile wird vom System automatisch erkannt und ein Kalendereintrag erstellt.
+- Wenn der Kunde nur allgemein nach einem Termin fragt (ohne konkretes Datum): Termine vorschlagen und KEINE TERMIN-Zeile schreiben.
+
 ECHTE BEISPIELE VON FABIAN (so schreibt er wirklich):
 
 BEISPIEL 1 - Falsche Achsen (eBay, informell):
@@ -410,6 +422,7 @@ CATEGORIES = [
     "kombiversand",      # Sammelbestellung, 14-Tage-Regel
     "rabattanfrage",     # Preisnachlass, Mengenrabatt
     "kontaktformular",   # Anfrage ueber Website-Kontaktformular
+    "termin",            # Abholung, Besichtigung, Terminvereinbarung
     "ignore"             # Newsletter, Spam, automatische Mails OHNE Kundenfrage
 ]
 
@@ -430,6 +443,7 @@ def classify_mail(subject, body):
             "kombiversand = Sammelbestellung, 14-Tage-Regel\n"
             "rabattanfrage = Preisnachlass, Mengenrabatt\n"
             "kontaktformular = Anfrage ueber Website-Kontaktformular (Betreff enthaelt 'Kontakt', 'Neuer Eintrag', 'Formular')\n"
+            "termin = Abholung, Besichtigung, Terminvereinbarung, Terminbestaetigung, Terminwunsch\n"
             "ignore = NUR Newsletter, Spam, rein automatische System-Mails OHNE Kundenfrage\n\n"
             "WICHTIG: Wenn eine Mail eine Kundenfrage enthaelt (egal ob per Formular oder direkt), ist es NIEMALS ignore!\n"
             "Mails mit Betreff 'Neuer Eintrag: Kontakt' sind Kontaktformular-Anfragen, NICHT ignore.\n\n"
@@ -902,7 +916,8 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
     cat_emoji = {
         "lieferstatus": "📦", "retoure": "↩️", "beschwerde": "⚠️",
         "produktfrage": "❓", "stornierung": "❌", "rechnung_steuer": "🧾",
-        "kombiversand": "📮", "rabattanfrage": "💰", "kontaktformular": "📋"
+        "kombiversand": "📮", "rabattanfrage": "💰", "kontaktformular": "📋",
+        "termin": "📅"
     }
     cat_icon = cat_emoji.get(category, "📧")
 
@@ -1344,6 +1359,16 @@ def handle_telegram_update(update):
                     daily_stats["ebay_answered"] += 1
                 else:
                     daily_stats["shop_answered"] += 1
+
+                # Termin erkennen und ICS-Datei senden
+                termin = extract_termin_from_draft(p.get("draft", ""))
+                if termin:
+                    ics = create_ics_file(termin)
+                    filename = f"Termin_{termin['date']}_{termin['typ'].replace(' ', '_')}.ics"
+                    send_telegram_document(
+                        ics, filename,
+                        f"📅 Termin: {termin['typ']} mit {termin['kunde']} am {termin['date']} um {termin['time']} Uhr"
+                    )
             else:
                 send_telegram_text(f"⚠️ Fehler! Bitte manuell antworten an {p['sender']}")
             # Alte Nachrichten aus Telegram loeschen
@@ -1519,6 +1544,87 @@ def mark_mail_as_answered(imap_uid):
             log.info(f"Mail als beantwortet markiert (UID: {imap_uid})")
     except Exception as e:
         log.warning(f"Mail als beantwortet markieren: {e}")
+
+
+# ============================================================
+# KALENDER: ICS-Datei erstellen und per Telegram senden
+# ============================================================
+
+def extract_termin_from_draft(draft_text):
+    """Extrahiere Termindaten aus dem Antwort-Entwurf (TERMIN: YYYY-MM-DD HH:MM | Typ | Name)."""
+    import re
+    match = re.search(r'TERMIN:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s*\|\s*([^|]+)\s*\|\s*(.+)', draft_text)
+    if match:
+        return {
+            "date": match.group(1),
+            "time": match.group(2),
+            "typ": match.group(3).strip(),
+            "kunde": match.group(4).strip()
+        }
+    return None
+
+
+def create_ics_file(termin_data):
+    """Erstelle eine ICS-Kalenderdatei fuer den Termin."""
+    from datetime import datetime, timedelta
+    import uuid
+
+    date_str = termin_data["date"]
+    time_str = termin_data["time"]
+    typ = termin_data["typ"]
+    kunde = termin_data["kunde"]
+
+    # Start- und Endzeit berechnen (30 Minuten Dauer)
+    start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    end = start + timedelta(minutes=30)
+
+    # ICS Format
+    uid = str(uuid.uuid4())
+    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    start_str = start.strftime("%Y%m%dT%H%M%S")
+    end_str = end.strftime("%Y%m%dT%H%M%S")
+
+    ics_content = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Modellbahn-Rhein-Main//Mailbot//DE
+BEGIN:VEVENT
+UID:{uid}
+DTSTAMP:{now}
+DTSTART;TZID=Europe/Berlin:{start_str}
+DTEND;TZID=Europe/Berlin:{end_str}
+SUMMARY:{typ} - {kunde}
+LOCATION:Max-Planck-Str. 18, 63322 Rödermark
+DESCRIPTION:{typ} mit {kunde} bei Modellbahn-Rhein-Main
+STATUS:CONFIRMED
+BEGIN:VALARM
+TRIGGER:-PT30M
+ACTION:DISPLAY
+DESCRIPTION:Termin in 30 Minuten: {typ} mit {kunde}
+END:VALARM
+END:VEVENT
+END:VCALENDAR"""
+
+    return ics_content
+
+
+def send_telegram_document(file_content, filename, caption=""):
+    """Sende ein Dokument (z.B. ICS-Datei) per Telegram."""
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
+    try:
+        r = requests.post(
+            url,
+            files={"document": (filename, file_content.encode("utf-8"), "text/calendar")},
+            data={"chat_id": TG_CHAT_ID, "caption": caption},
+            timeout=15
+        )
+        if r.status_code == 200:
+            log.info(f"Kalender-Datei gesendet: {filename}")
+            return r.json().get("result", {}).get("message_id")
+        else:
+            log.error(f"Telegram Dokument Fehler: {r.status_code}")
+    except Exception as e:
+        log.error(f"Telegram Dokument: {e}")
+    return None
 
 
 # ============================================================
