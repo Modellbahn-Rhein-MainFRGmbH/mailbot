@@ -1582,42 +1582,67 @@ def create_ics_file(termin_data):
     start = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
     end = start + timedelta(minutes=30)
 
-    # ICS Format
     uid = str(uuid.uuid4())
     now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     start_str = start.strftime("%Y%m%dT%H%M%S")
     end_str = end.strftime("%Y%m%dT%H%M%S")
 
-    ics_content = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//Modellbahn-Rhein-Main//Mailbot//DE
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{now}
-DTSTART;TZID=Europe/Berlin:{start_str}
-DTEND;TZID=Europe/Berlin:{end_str}
-SUMMARY:{typ} - {kunde}
-LOCATION:Max-Planck-Str. 18, 63322 Rödermark
-DESCRIPTION:{typ} mit {kunde} bei Modellbahn-Rhein-Main
-STATUS:CONFIRMED
-BEGIN:VALARM
-TRIGGER:-PT30M
-ACTION:DISPLAY
-DESCRIPTION:Termin in 30 Minuten: {typ} mit {kunde}
-END:VALARM
-END:VEVENT
-END:VCALENDAR"""
+    # ICS Format - KEINE Einrueckung, jede Zeile muss am Anfang beginnen!
+    # VTIMEZONE fuer Apple Kalender Kompatibilitaet
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "PRODID:-//Modellbahn-Rhein-Main//Mailbot//DE",
+        "BEGIN:VTIMEZONE",
+        "TZID:Europe/Berlin",
+        "BEGIN:STANDARD",
+        "DTSTART:19701025T030000",
+        "RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10",
+        "TZOFFSETFROM:+0200",
+        "TZOFFSETTO:+0100",
+        "TZNAME:CET",
+        "END:STANDARD",
+        "BEGIN:DAYLIGHT",
+        "DTSTART:19700329T020000",
+        "RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3",
+        "TZOFFSETFROM:+0100",
+        "TZOFFSETTO:+0200",
+        "TZNAME:CEST",
+        "END:DAYLIGHT",
+        "END:VTIMEZONE",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{now}",
+        f"DTSTART;TZID=Europe/Berlin:{start_str}",
+        f"DTEND;TZID=Europe/Berlin:{end_str}",
+        f"SUMMARY:{typ} - {kunde}",
+        "LOCATION:Max-Planck-Str. 18\\, 63322 Roedermark",
+        f"DESCRIPTION:{typ} mit {kunde} bei Modellbahn-Rhein-Main",
+        "STATUS:CONFIRMED",
+        "BEGIN:VALARM",
+        "TRIGGER:-PT30M",
+        "ACTION:DISPLAY",
+        f"DESCRIPTION:Termin in 30 Minuten: {typ} mit {kunde}",
+        "END:VALARM",
+        "END:VEVENT",
+        "END:VCALENDAR"
+    ]
 
-    return ics_content
+    # ICS braucht CRLF Zeilenenden
+    return "\r\n".join(lines)
 
 
 def send_telegram_document(file_content, filename, caption=""):
     """Sende ein Dokument (z.B. ICS-Datei) per Telegram."""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
     try:
+        # ICS als Bytes mit korrektem MIME-Type senden
+        file_bytes = file_content.encode("utf-8") if isinstance(file_content, str) else file_content
         r = requests.post(
             url,
-            files={"document": (filename, file_content.encode("utf-8"), "text/calendar")},
+            files={"document": (filename, file_bytes, "application/ics")},
             data={"chat_id": TG_CHAT_ID, "caption": caption},
             timeout=15
         )
@@ -1625,7 +1650,7 @@ def send_telegram_document(file_content, filename, caption=""):
             log.info(f"Kalender-Datei gesendet: {filename}")
             return r.json().get("result", {}).get("message_id")
         else:
-            log.error(f"Telegram Dokument Fehler: {r.status_code}")
+            log.error(f"Telegram Dokument Fehler {r.status_code}: {r.text[:100]}")
     except Exception as e:
         log.error(f"Telegram Dokument: {e}")
     return None
