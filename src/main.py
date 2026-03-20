@@ -46,6 +46,9 @@ TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 # Claude
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 
+# Groq (Spracherkennung fuer Telegram Voice Messages)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
 # Feedback-Datei (Railway Volume oder lokaler Pfad)
 FEEDBACK_DIR  = os.environ.get("FEEDBACK_DIR", "/data")
 FEEDBACK_FILE = os.path.join(FEEDBACK_DIR, "feedback_history.json")
@@ -1078,8 +1081,60 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
     def tg_escape(text):
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    # VOLLSTAENDIGER Body - kein Kuerzen mehr! Aber HTML-safe machen
-    full_body = tg_escape(body.strip())
+    # === SICHERHEITSNETZ: Body vor Telegram-Anzeige bereinigen ===
+    import re as _re
+    display_body = body.strip()
+
+    # Pruefen ob der Body noch HTML/CSS-Muell enthaelt
+    html_indicators = ['<div', '<table', '<td', '<tr', '<style', '<html', '<body',
+                       'cellpadding', 'cellspacing', 'border-collapse', 'font-family',
+                       'text-decoration', '!important', 'font-size:', 'line-height:',
+                       'background-color:', 'padding:', 'margin:', 'width:', 'border:']
+    indicator_count = sum(1 for ind in html_indicators if ind.lower() in display_body.lower())
+
+    if indicator_count >= 3:
+        # Body ist noch voller HTML/CSS - nochmal aggressiv bereinigen
+        log.warning(f"Body enthaelt noch HTML/CSS ({indicator_count} Indikatoren) - bereinige nochmal")
+        display_body = ebay_html_to_text(display_body)
+
+    # Zweite Pruefung: Wenn immer noch Muell drin ist, Zeilen einzeln filtern
+    if display_body:
+        clean_lines = []
+        for line in display_body.split('\n'):
+            line_stripped = line.strip()
+            if not line_stripped:
+                clean_lines.append('')
+                continue
+            # Zeilen mit CSS/HTML-Mustern rauswerfen
+            if _re.search(r'(?:font-size|font-family|text-decoration|border-collapse|cellpadding|cellspacing|text-align|line-height|vertical-align|background-color|!important|padding:\s*\d|margin:\s*\d|\.[\w-]+\s*\{|border:\s*\d|width:\s*\d+px)', line_stripped, _re.IGNORECASE):
+                continue
+            # Zeilen die hauptsaechlich aus HTML-Attributen bestehen
+            if _re.search(r'(?:style=|class=|align=|valign=|bgcolor=|colspan=|rowspan=)', line_stripped, _re.IGNORECASE):
+                continue
+            # HTML-Tag-Fragmente (z.B. '50" >', '" > <td', 'border="0"')
+            if _re.search(r'["\']?\s*/?>', line_stripped) and len(line_stripped) < 50:
+                # Kurze Zeile mit > drin - pruefen ob es echter Text ist
+                text_chars = sum(1 for c in line_stripped if c.isalpha())
+                if text_chars < 5:
+                    continue  # Fast keine Buchstaben = HTML-Fragment
+            # Zeilen die fast nur Sonderzeichen sind (auch kurze Zeilen!)
+            if len(line_stripped) > 3:
+                alnum = sum(1 for c in line_stripped if c.isalnum() or c == ' ')
+                if alnum / len(line_stripped) < 0.5:
+                    continue  # Weniger als 50% Buchstaben/Zahlen/Leerzeichen = Muell
+            clean_lines.append(line_stripped)
+        display_body = '\n'.join(clean_lines)
+        display_body = _re.sub(r'\n{3,}', '\n\n', display_body).strip()
+
+    # Wenn nach Bereinigung nichts uebrig: Fallback-Text
+    if not display_body or len(display_body) < 5:
+        display_body = "(Nachrichtentext konnte nicht extrahiert werden - bitte im eBay-Portal pruefen)"
+
+    # Max 2000 Zeichen fuer Kunden-Nachricht in Telegram (verhindert Multi-Message-Spam)
+    if len(display_body) > 2000:
+        display_body = display_body[:1950] + "\n\n[... gekuerzt ...]"
+
+    full_body = tg_escape(display_body)
     safe_subject = tg_escape(subject)
     safe_mail_body = tg_escape(mail_body)
 
@@ -1533,6 +1588,70 @@ def get_telegram_updates(offset=0):
         return []
 
 
+def transcribe_voice_message(file_id):
+    """Telegram Voice Message herunterladen und per Groq Whisper transkribieren."""
+    if not GROQ_API_KEY:
+        log.warning("Sprachnachricht empfangen, aber GROQ_API_KEY nicht konfiguriert")
+        return None
+
+    try:
+        # Schritt 1: File-Info von Telegram holen
+        r = requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getFile",
+            params={"file_id": file_id},
+            timeout=10
+        )
+        if r.status_code != 200:
+            log.error(f"Telegram getFile Fehler: {r.status_code}")
+            return None
+
+        file_path = r.json().get("result", {}).get("file_path", "")
+        if not file_path:
+            log.error("Telegram getFile: Kein file_path")
+            return None
+
+        # Schritt 2: Datei herunterladen
+        file_r = requests.get(
+            f"https://api.telegram.org/file/bot{TG_TOKEN}/{file_path}",
+            timeout=30
+        )
+        if file_r.status_code != 200:
+            log.error(f"Telegram File-Download Fehler: {file_r.status_code}")
+            return None
+
+        audio_data = file_r.content
+        log.info(f"Voice Message heruntergeladen: {len(audio_data)} Bytes ({file_path})")
+
+        # Schritt 3: An Groq Whisper API senden
+        # Dateiendung aus Telegram-Pfad ermitteln (meist .oga oder .ogg)
+        ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "ogg"
+        filename = f"voice.{ext}"
+
+        groq_r = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (filename, audio_data, "audio/ogg")},
+            data={
+                "model": "whisper-large-v3",
+                "language": "de",
+                "response_format": "text"
+            },
+            timeout=30
+        )
+
+        if groq_r.status_code == 200:
+            transcript = groq_r.text.strip()
+            log.info(f"Sprachnachricht transkribiert: {transcript[:100]}")
+            return transcript
+        else:
+            log.error(f"Groq Whisper Fehler {groq_r.status_code}: {groq_r.text[:200]}")
+            return None
+
+    except Exception as e:
+        log.error(f"Voice-Transkription: {e}")
+        return None
+
+
 def handle_telegram_update(update):
     if "callback_query" in update:
         cq     = update["callback_query"]
@@ -1633,6 +1752,7 @@ def handle_telegram_update(update):
                 f"- Freundlicher formulieren\n"
                 f"- Retourenlink Shop einfuegen\n"
                 f"- Auf Englisch schreiben\n\n"
+                f"💡 Du kannst auch eine Sprachnachricht schicken!\n\n"
                 f"Token: <code>{token}</code>"
             )
         elif action == "ignore":
@@ -1651,6 +1771,27 @@ def handle_telegram_update(update):
         text = update["message"].get("text", "").strip()
         msg_id = update["message"].get("message_id")
 
+        # Voice Message: Transkribieren und als Text weiterverarbeiten
+        voice = update["message"].get("voice") or update["message"].get("audio")
+        if voice and not text:
+            file_id = voice.get("file_id")
+            duration = voice.get("duration", 0)
+            if not GROQ_API_KEY:
+                send_telegram_text("🎤 Sprachnachricht empfangen, aber Spracherkennung nicht konfiguriert.\nBitte GROQ_API_KEY in Railway eintragen.")
+                return
+            if duration > 300:  # Max 5 Minuten
+                send_telegram_text("⚠️ Sprachnachricht zu lang (max 5 Minuten).")
+                return
+
+            send_telegram_text("🎤 Höre zu...")
+            transcript = transcribe_voice_message(file_id)
+            if transcript:
+                text = transcript
+                send_telegram_text(f"🎤 Verstanden:\n<i>{transcript}</i>")
+            else:
+                send_telegram_text("⚠️ Sprachnachricht konnte nicht erkannt werden. Bitte nochmal versuchen oder als Text schreiben.")
+                return
+
         if not text:
             return
 
@@ -1663,12 +1804,14 @@ def handle_telegram_update(update):
             fb_count = len(load_feedback())
             pending_count = len(pending)
             ebay_status = "aktiv" if EBAY_ENABLED else "nicht konfiguriert"
+            voice_status = "aktiv" if GROQ_API_KEY else "nicht konfiguriert (GROQ_API_KEY fehlt)"
             status_msg = (
                 f"📊 <b>Bot-Status</b>\n"
                 f"Offene Vorgaenge: {pending_count}\n"
                 f"Korrekturen im Archiv: {fb_count}\n"
                 f"eBay API: {ebay_status}\n"
-                f"eBay verarbeitet: {len(ebay_processed_ids)} Nachrichten"
+                f"eBay verarbeitet: {len(ebay_processed_ids)} Nachrichten\n"
+                f"🎤 Sprachnachrichten: {voice_status}"
             )
             send_telegram_text(status_msg)
             return
@@ -2352,15 +2495,16 @@ def main():
     fb_count = len(load_feedback())
     fb_info = f"\n📊 {fb_count} Korrekturen im Lernarchiv" if fb_count > 0 else ""
     ebay_info = "✅ eBay API aktiv" if EBAY_ENABLED else "⏳ eBay API noch nicht konfiguriert"
+    voice_info = "✅ Sprachnachrichten aktiv" if GROQ_API_KEY else "⏳ Sprachnachrichten nicht konfiguriert (GROQ_API_KEY)"
 
     send_telegram_text(
         f"🚂 <b>Modellbahn Mail Assistent v5 gestartet!</b>\n"
         f"Ich ueberwache dein Postfach und eBay.\n\n"
-        f"<b>Neu in v5:</b>\n"
         f"📂 Feine Kategorien (Lieferstatus, Retoure, Beschwerde, ...)\n"
         f"🧠 Lerne aus deinen Korrekturen\n"
         f"📦 Bessere Bestelldaten aus WooCommerce\n"
-        f"🏪 {ebay_info}{fb_info}"
+        f"🏪 {ebay_info}\n"
+        f"🎤 {voice_info}{fb_info}"
     )
     offset     = 0
     mail_timer = 0
