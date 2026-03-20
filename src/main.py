@@ -415,6 +415,149 @@ def html_to_text(html):
     return text.strip()
 
 
+def ebay_html_to_text(html):
+    """Aggressive HTML-zu-Text Konvertierung speziell fuer eBay-Nachrichten.
+    eBay packt die Kaeufer-Nachricht in ein riesiges HTML-E-Mail-Template
+    mit CSS, Tables, Bildern etc. Diese Funktion extrahiert NUR den Text."""
+    import re
+
+    text = html
+
+    # Schritt 1: Versuche den eigentlichen Nachrichtentext zu finden
+    # eBay hat den User-Text oft in einem bestimmten Container
+    # Typische Muster: "Nachricht von <user>" gefolgt vom eigentlichen Text
+    user_msg_patterns = [
+        # eBay DE: Nachricht ist oft nach "Nachricht von" oder in einem spezifischen div
+        r'(?:Nachricht\s+von\s+\w+[^<]*?:?\s*</[^>]+>\s*(?:<[^>]+>\s*)*)(.*?)(?:<[^>]*(?:Antworten|Respond|Diese Nachricht|This message|Marketplace|eBay International))',
+        # eBay: Content nach dem letzten Header, vor dem Footer
+        r'<!-- BUYER.?MESSAGE -->(.+?)<!-- END.?BUYER',
+        r'class="[^"]*message[^"]*"[^>]*>(.*?)</(?:div|td)',
+        # Fallback: Text zwischen bekannten eBay-Wrappern
+        r'<td[^>]*class="[^"]*(?:message|content|body)[^"]*"[^>]*>(.*?)</td>',
+    ]
+
+    extracted = None
+    for pattern in user_msg_patterns:
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip()
+            # Nur verwenden wenn genuegend Text drin ist
+            clean_candidate = re.sub(r'<[^>]+>', '', candidate).strip()
+            if len(clean_candidate) > 10:
+                extracted = candidate
+                log.info(f"eBay Nachrichtentext per Pattern extrahiert ({len(clean_candidate)} Zeichen)")
+                break
+
+    # Schritt 2: Falls Pattern-Extraktion geklappt hat, nur diesen Teil nehmen
+    if extracted:
+        text = extracted
+
+    # Schritt 3: Aggressives Cleaning
+    # CDATA Bloecke entfernen
+    text = re.sub(r'<!\[CDATA\[.*?\]\]>', '', text, flags=re.DOTALL)
+    # Kommentare entfernen
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+    # Style-Bloecke entfernen (auch mit CDATA drin)
+    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Script-Bloecke entfernen
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Head-Bereich komplett entfernen
+    text = re.sub(r'<head[^>]*>.*?</head>', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Zeilenumbrueche vor Tag-Entfernung
+    text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</div>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</tr>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</li>', '\n', text, flags=re.IGNORECASE)
+
+    # Alle HTML-Tags entfernen (auch mehrzeilige)
+    text = re.sub(r'<[^>]+>', ' ', text, flags=re.DOTALL)
+
+    # HTML-Entities
+    text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    text = text.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&#39;', "'")
+    text = re.sub(r'&#\d+;', ' ', text)  # Numerische Entities
+    text = re.sub(r'&\w+;', ' ', text)   # Restliche benannte Entities
+
+    # CSS-Reste entfernen die durchgerutscht sind
+    # Inline-Styles: alles was wie CSS aussieht
+    text = re.sub(r'\{[^}]*\}', ' ', text)  # CSS-Bloecke { ... }
+    text = re.sub(r'[\w-]+\s*:\s*[^;{}\n]{0,100}\s*(?:!important)?;', ' ', text)  # property: value;
+    text = re.sub(r'@media[^{]*\{[^}]*\}', ' ', text, flags=re.DOTALL)  # @media queries
+    text = re.sub(r'\.[\w-]+\s*\{', ' ', text)  # .class {
+    text = re.sub(r'#[\w-]+\s*\{', ' ', text)  # #id {
+
+    # HTML-Attribut-Reste entfernen
+    text = re.sub(r'\b(?:style|class|width|height|border|cellpadding|cellspacing|align|valign|bgcolor|colspan|rowspan)\s*=\s*"[^"]*"', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(?:style|class|width|height|border|cellpadding|cellspacing|align|valign|bgcolor|colspan|rowspan)\s*=\s*\'[^\']*\'', ' ', text, flags=re.IGNORECASE)
+
+    # URLs die kein Tracking/Shop sind entfernen (eBay-Template-Bilder etc.)
+    text = re.sub(r'https?://(?:ir\.ebaystatic|pics\.ebaystatic|(?:www\.)?ebaystatic)[^\s]*', ' ', text)
+
+    # eBay-Boilerplate Texte entfernen
+    boilerplate = [
+        r'Diese Nachricht wurde.*?(?:gesendet|geschickt).*',
+        r'This message was sent.*',
+        r'Antworten Sie nicht auf diese E-Mail.*',
+        r'Do not reply to this email.*',
+        r'Marketplace-Nachrichten.*',
+        r'Copyright.*?eBay.*',
+        r'eBay International AG.*',
+        r'Datenschutzrichtlinie.*',
+        r'Privacy Policy.*',
+        r'Klicken Sie hier.*?(?:antworten|respond).*',
+        r'Click here to respond.*',
+        r'Weitere Informationen finden Sie.*',
+        r'eBay-Kaufabwicklung.*',
+        r'Um mehr zu erfahren.*',
+        r'Learn more about.*',
+        r'eBay hat diese Nachricht.*',
+        r'eBay sent this message.*',
+        r'Alle Rechte vorbehalten.*',
+        r'All rights reserved.*',
+        r'Hilfe.*?Kontakt.*?Sicherheitsportal.*',
+        r'Help.*?Contact.*?Security.*',
+    ]
+    for pattern in boilerplate:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Whitespace aufraeumen
+    text = re.sub(r'[ \t]+', ' ', text)          # Mehrfache Leerzeichen
+    text = re.sub(r' *\n *', '\n', text)          # Leerzeichen um Newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)        # Max 2 Leerzeilen
+    text = re.sub(r'(\| *)+', ' ', text)          # Pipe-Reste von Tabellen
+    text = re.sub(r'^\s*\|?\s*$', '', text, flags=re.MULTILINE)  # Leere Zeilen mit Pipes
+
+    text = text.strip()
+
+    # Schritt 4: Qualitaetspruefung - wenn Text zu kurz oder immer noch zu viel Muell
+    if text:
+        # Zeilen filtern die wie Code/CSS aussehen
+        clean_lines = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                clean_lines.append('')
+                continue
+            # Zeile ueberspringen wenn sie hauptsaechlich aus CSS/HTML besteht
+            css_chars = sum(1 for c in line if c in '{}:;=<>"\'')
+            if len(line) > 10 and css_chars / len(line) > 0.3:
+                continue  # Mehr als 30% Sonderzeichen = wahrscheinlich Muell
+            # Zeile ueberspringen wenn sie bekannte HTML/CSS Fragmente enthaelt
+            if re.search(r'(?:font-size|font-family|text-decoration|border-collapse|padding|margin|!important|cellpadding|cellspacing|text-align|line-height|vertical-align|background-color)', line, re.IGNORECASE):
+                continue
+            clean_lines.append(line)
+        text = '\n'.join(clean_lines)
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+
+    if not text or len(text) < 5:
+        text = "(eBay-Nachricht konnte nicht gelesen werden - bitte im eBay-Portal pruefen)"
+
+    log.info(f"eBay HTML bereinigt: {len(html)} -> {len(text)} Zeichen")
+    return text
+
+
 # ============================================================
 # VERBESSERTE KLASSIFIZIERUNG: Feine Kategorien statt nur question/ignore
 # ============================================================
@@ -2003,41 +2146,8 @@ def ebay_check_messages():
 
             # === FILTER BESTANDEN: Echte Kaeufer-Nachricht ===
 
-            # HTML aus Body entfernen
-            if raw_body.strip().startswith("<!") or raw_body.strip().startswith("<html") or "<body" in raw_body.lower():
-                body = html_to_text(raw_body)
-            else:
-                body = re.sub(r'<[^>]+>', ' ', raw_body)
-                body = body.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-                body = body.replace('&nbsp;', ' ').replace('&quot;', '"').replace('&apos;', "'")
-                body = re.sub(r'\s+', ' ', body).strip()
-
-            # Body nochmal bereinigen: Nur den eigentlichen Nachrichtentext behalten
-            # eBay fuegt oft viel Boilerplate hinzu - versuche den Kern zu extrahieren
-            if body:
-                # Typische eBay-Boilerplate am Ende entfernen
-                boilerplate_markers = [
-                    "Diese Nachricht wurde von eBay",
-                    "This message was sent from eBay",
-                    "Antworten Sie nicht auf diese E-Mail",
-                    "Do not reply to this email",
-                    "Marketplace-Nachrichten",
-                    "Copyright eBay",
-                    "eBay International AG",
-                    "Datenschutzrichtlinie",
-                    "Privacy Policy",
-                    "Klicken Sie hier, um diese Nachricht",
-                    "Click here to respond",
-                    "Weitere Informationen finden Sie",
-                    "eBay-Kaufabwicklung",
-                    "Um mehr zu erfahren",
-                    "Learn more about"
-                ]
-                for marker in boilerplate_markers:
-                    pos = body.find(marker)
-                    if pos > 20:  # Nicht am Anfang abschneiden
-                        body = body[:pos].strip()
-                        break
+            # HTML aus Body entfernen - eBay-spezifische aggressive Bereinigung
+            body = ebay_html_to_text(raw_body)
 
             # Auch Subject bereinigen
             subject = subject.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
@@ -2066,7 +2176,7 @@ def ebay_check_messages():
                             prev_sender_name = prev_sender_m.group(1) if prev_sender_m else "Unbekannt"
                             prev_body_text = prev_body_m.group(1)
                             if "<" in prev_body_text:
-                                prev_body_text = html_to_text(prev_body_text)
+                                prev_body_text = ebay_html_to_text(prev_body_text)
                             prev_date = prev_date_m.group(1)[:10] if prev_date_m else ""
                             history_parts.append(f"[{prev_date} {prev_sender_name}]: {prev_body_text.strip()}")
                     if history_parts:
