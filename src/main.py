@@ -939,7 +939,6 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
     full_body = tg_escape(body.strip())
     safe_subject = tg_escape(subject)
     safe_mail_body = tg_escape(mail_body)
-    ctx_display = tg_escape(order_context)
 
     # Nachricht zusammenbauen
     msg = (
@@ -968,8 +967,31 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
             f"--------------------"
         )
 
+    # URLs aus Bestelldaten extrahieren und klickbar machen
+    import re as _re
+    clickable_links = []
+    ctx_for_code = order_context
+
+    # Shop-Links extrahieren
+    for match in _re.finditer(r'Shop-Link:\s*(https?://\S+)', order_context):
+        url = match.group(1)
+        clickable_links.append(f"🛒 <a href=\"{tg_escape(url)}\">Shop-Link</a>")
+        ctx_for_code = ctx_for_code.replace(url, "(siehe Link unten)")
+
+    # Tracking-Links extrahieren
+    for match in _re.finditer(r'Tracking:\s*(https?://\S+)', order_context):
+        url = match.group(1)
+        clickable_links.append(f"📦 <a href=\"{tg_escape(url)}\">Tracking-Link</a>")
+        ctx_for_code = ctx_for_code.replace(url, "(siehe Link unten)")
+
+    ctx_display_clean = tg_escape(ctx_for_code)
+    links_section = ""
+    if clickable_links:
+        links_section = "\n" + "\n".join(clickable_links) + "\n"
+
     msg += (
-        f"\n\n<b>Bestelldaten:</b>\n<code>{ctx_display}</code>\n\n"
+        f"\n\n<b>Bestelldaten:</b>\n<code>{ctx_display_clean}</code>"
+        f"{links_section}\n"
         f"<b>Mein Vorschlag:</b>\n"
         f"--------------------\n"
         f"{safe_mail_body}\n"
