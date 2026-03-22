@@ -521,9 +521,25 @@ def ebay_html_to_text(html):
         r'All rights reserved.*',
         r'Hilfe.*?Kontakt.*?Sicherheitsportal.*',
         r'Help.*?Contact.*?Security.*',
+        # eBay Kauf-Details Boilerplate
+        r'Einzelheiten zum Kauf ansehen.*',
+        r'Nur K.ufe bei eBay sind.*?(?:abgesichert|erlaubt)\.?.*',
+        r'Beim Handelspartner nachzufragen.*?(?:erlaubt|allowed)\.?.*',
+        r'E-Mail-Referenznummer:?\s*\[?#?[a-z0-9\-_#\[\]]+\]?.*',
+        r'Nachrichten an dieses Postfach werden nicht gelesen.*',
+        r'Bitte antworten Sie nicht auf diese Nachricht.*',
+        r'Bei Fragen gehen Sie bitte zu Hilfe.*',
+        # eBay Bestellinfo-Zeilen
+        r'Bestellstatus:\s*\w+',
+        # eBay Button-Texte und UI-Elemente
+        r'^Antworten$',
+        r'^Mit Preisvorschlag antworten$',
+        r'^Neue Nachricht von:?\s*$',
+        r'^Details zum Kauf$',
+        r'^View purchase details$',
     ]
     for pattern in boilerplate:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL | re.MULTILINE)
 
     # Whitespace aufraeumen
     text = re.sub(r'[ \t]+', ' ', text)          # Mehrfache Leerzeichen
@@ -556,6 +572,31 @@ def ebay_html_to_text(html):
 
     if not text or len(text) < 5:
         text = "(eBay-Nachricht konnte nicht gelesen werden - bitte im eBay-Portal pruefen)"
+
+    # Schritt 5: Deduplizierung - eBay schickt den Nachrichtentext oft doppelt
+    # (einmal als Vorschau/Header, einmal als eigentliche Nachricht)
+    if text and len(text) > 50:
+        paragraphs = re.split(r'\n\s*\n', text)
+        if len(paragraphs) >= 2:
+            seen = []
+            unique_paragraphs = []
+            for para in paragraphs:
+                para_clean = para.strip()
+                if not para_clean:
+                    continue
+                # Pruefen ob dieser Absatz schon vorkam (fuzzy: erste 60 Zeichen vergleichen)
+                para_key = re.sub(r'\s+', ' ', para_clean)[:60].lower()
+                is_dupe = False
+                for seen_key in seen:
+                    if para_key == seen_key:
+                        is_dupe = True
+                        break
+                if not is_dupe:
+                    seen.append(para_key)
+                    unique_paragraphs.append(para_clean)
+                else:
+                    log.info(f"eBay Duplikat entfernt: {para_clean[:60]}...")
+            text = '\n\n'.join(unique_paragraphs)
 
     log.info(f"eBay HTML bereinigt: {len(html)} -> {len(text)} Zeichen")
     return text
@@ -1110,6 +1151,12 @@ def send_approval_request(token, sender, subject, body, draft, channel, order_co
                 continue
             # Zeilen die hauptsaechlich aus HTML-Attributen bestehen
             if _re.search(r'(?:style=|class=|align=|valign=|bgcolor=|colspan=|rowspan=)', line_stripped, _re.IGNORECASE):
+                continue
+            # eBay-Boilerplate Zeilen rauswerfen
+            if _re.search(r'(?:Einzelheiten zum Kauf|Nur K.ufe bei eBay sind|K.uferschutzprogramme|Handelspartner nachzufragen|Transaktion au.erhalb|E-Mail-Referenznummer|Nachrichten an dieses Postfach|antworten Sie nicht auf diese|Hilfe \& Kontakt|^Antworten$|^Mit Preisvorschlag antworten$|^Neue Nachricht von|^Details zum Kauf$|Bestellstatus:\s*\w)', line_stripped, _re.IGNORECASE):
+                continue
+            # Referenznummer-Hashes (z.B. [#a01-qjk8af1n67#]_[#2446d5a5bde...])
+            if _re.search(r'\[#[a-z0-9\-]+#\]', line_stripped, _re.IGNORECASE):
                 continue
             # HTML-Tag-Fragmente (z.B. '50" >', '" > <td', 'border="0"')
             if _re.search(r'["\']?\s*/?>', line_stripped) and len(line_stripped) < 50:
