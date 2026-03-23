@@ -400,6 +400,17 @@ def get_mail_body_and_images(msg):
                 try:
                     img_data = part.get_payload(decode=True)
                     if img_data:
+                        # Logo-Filter: Kleine Bilder (<15KB) und Inline-Bilder (Signatur-Logos) ignorieren
+                        content_id = part.get("Content-ID", "")
+                        filename = part.get_filename() or ""
+                        is_inline = bool(content_id) or "inline" in cd.lower()
+                        is_small = len(img_data) < 15000  # < 15KB = wahrscheinlich Logo
+                        # Bekannte Logo-Dateinamen filtern
+                        logo_names = ["logo", "banner", "signature", "icon", "footer", "header", "brand"]
+                        is_logo_name = any(n in filename.lower() for n in logo_names)
+                        if is_small or is_inline or is_logo_name:
+                            log.info(f"Bild gefiltert (Logo/Inline): {filename or 'unbenannt'} ({len(img_data)} Bytes, inline={is_inline})")
+                            continue
                         images.append(img_data)
                 except:
                     pass
@@ -1664,6 +1675,17 @@ def is_ebay_notification(sender):
     return any(pattern in sender_lower for pattern in ebay_patterns)
 
 
+def is_system_notification(sender):
+    """Pruefe ob die Mail eine System-Benachrichtigung ist die ignoriert werden soll.
+    Betrifft Sendcloud, Versanddienstleister-Benachrichtigungen etc."""
+    sender_lower = sender.lower()
+    system_senders = [
+        "no-reply@sendcloud.com",
+        "noreply@sendcloud.com",
+    ]
+    return any(addr in sender_lower for addr in system_senders)
+
+
 def check_inbox():
     try:
         with imaplib.IMAP4_SSL(MAIL_HOST) as imap:
@@ -1681,7 +1703,12 @@ def check_inbox():
                 # eBay-Mails ignorieren (werden ueber eBay API abgerufen)
                 if is_ebay_notification(sender):
                     log.info(f"eBay-Mail ignoriert: {subject}")
-                    # eBay-Mails trotzdem als gelesen markieren damit sie nicht nochmal kommen
+                    imap.store(mid, '+FLAGS', '\\Seen')
+                    continue
+
+                # System-Benachrichtigungen ignorieren (Sendcloud etc.)
+                if is_system_notification(sender):
+                    log.info(f"System-Mail ignoriert: {sender} - {subject}")
                     imap.store(mid, '+FLAGS', '\\Seen')
                     continue
 
