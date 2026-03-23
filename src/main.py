@@ -351,6 +351,33 @@ def decode_str(s):
     return "".join(result)
 
 
+def decode_payload(part):
+    """Dekodiere Mail-Payload mit korrektem Charset (UTF-8, ISO-8859-1, Windows-1252 etc.)."""
+    raw = part.get_payload(decode=True)
+    if not raw:
+        return ""
+    # Charset aus dem Mail-Header lesen (z.B. Content-Type: text/plain; charset="iso-8859-1")
+    charset = part.get_content_charset()
+    # Versuch 1: Charset aus dem Header verwenden
+    if charset:
+        try:
+            return raw.decode(charset)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    # Versuch 2: UTF-8
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # Versuch 3: Windows-1252 (gaengigstes Nicht-UTF-8 Encoding in DE-Mails)
+    try:
+        return raw.decode("windows-1252")
+    except UnicodeDecodeError:
+        pass
+    # Versuch 4: Latin-1 (kann alles dekodieren, verliert aber ggf. Info)
+    return raw.decode("latin-1", errors="replace")
+
+
 def get_mail_body_and_images(msg):
     body      = ""
     html_body = ""
@@ -361,12 +388,12 @@ def get_mail_body_and_images(msg):
             cd = str(part.get("Content-Disposition", ""))
             if ct == "text/plain" and "attachment" not in cd and not body:
                 try:
-                    body = part.get_payload(decode=True).decode("utf-8", errors="replace")
+                    body = decode_payload(part)
                 except:
                     pass
             elif ct == "text/html" and "attachment" not in cd and not html_body:
                 try:
-                    html_body = part.get_payload(decode=True).decode("utf-8", errors="replace")
+                    html_body = decode_payload(part)
                 except:
                     pass
             elif ct.startswith("image/") and len(images) < 3:
@@ -379,7 +406,7 @@ def get_mail_body_and_images(msg):
     else:
         ct = msg.get_content_type()
         try:
-            raw = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+            raw = decode_payload(msg)
             if ct == "text/html":
                 html_body = raw
             else:
@@ -1630,11 +1657,11 @@ def process_mail(subject, sender, body, channel="shop", ebay_thread_id=None, ima
 
 
 def is_ebay_notification(sender):
-    """Pruefe ob die Mail eine eBay-Benachrichtigung ist (ignorieren)."""
+    """Pruefe ob die Mail eine eBay-Benachrichtigung ist (ignorieren).
+    Blockt alle eBay-Domains unabhaengig vom Laendercode (.de, .com, .ca, .co.uk, .fr, etc.)."""
     sender_lower = sender.lower()
-    ebay_domains = ["@members.ebay.de", "@members.ebay.com", "@ebay.de", "@ebay.com",
-                    "@reply.ebay.de", "@reply.ebay.com"]
-    return any(domain in sender_lower for domain in ebay_domains)
+    ebay_patterns = ["@members.ebay.", "@ebay.", "@reply.ebay."]
+    return any(pattern in sender_lower for pattern in ebay_patterns)
 
 
 def check_inbox():
@@ -1861,14 +1888,17 @@ def handle_telegram_update(update):
                     )
             else:
                 send_telegram_text(f"⚠️ Fehler! Bitte manuell antworten an {p['sender']}")
-            # Alte Nachrichten aus Telegram loeschen
+            # Alte Nachrichten + Edit-Zwischen-Nachrichten aus Telegram loeschen
             delete_telegram_messages(p.get("telegram_msg_ids", []))
+            delete_telegram_messages(p.get("edit_msg_ids", []))
         elif action == "edit":
             pending[token]["awaiting_edit"] = True
+            if "edit_msg_ids" not in pending[token]:
+                pending[token]["edit_msg_ids"] = []
             # Statistik: Korrektur zaehlen
             reset_daily_stats_if_needed()
             daily_stats["edited"] += 1
-            send_telegram_text(
+            edit_prompt_id = send_telegram_text(
                 f"✏️ Was soll ich aendern?\n\n"
                 f"Beispiele:\n"
                 f"- 15 EUR Erstattung anbieten\n"
@@ -1878,8 +1908,11 @@ def handle_telegram_update(update):
                 f"💡 Du kannst auch eine Sprachnachricht schicken!\n\n"
                 f"Token: <code>{token}</code>"
             )
+            if edit_prompt_id:
+                pending[token]["edit_msg_ids"].append(edit_prompt_id)
         elif action == "ignore":
             tg_ids = p.get("telegram_msg_ids", [])
+            edit_ids = p.get("edit_msg_ids", [])
             # Mail als gelesen markieren
             mark_mail_as_seen(p.get("imap_uid"))
             # Statistik
@@ -1887,8 +1920,9 @@ def handle_telegram_update(update):
             daily_stats["ignored"] += 1
             del pending[token]
             send_telegram_text("🗑️ Vorgang ignoriert.")
-            # Alte Nachrichten aus Telegram loeschen
+            # Alte Nachrichten + Edit-Zwischen-Nachrichten aus Telegram loeschen
             delete_telegram_messages(tg_ids)
+            delete_telegram_messages(edit_ids)
 
     elif "message" in update:
         text = update["message"].get("text", "").strip()
@@ -1906,11 +1940,23 @@ def handle_telegram_update(update):
                 send_telegram_text("⚠️ Sprachnachricht zu lang (max 5 Minuten).")
                 return
 
-            send_telegram_text("🎤 Höre zu...")
+            hoere_zu_id = send_telegram_text("🎤 Höre zu...")
             transcript = transcribe_voice_message(file_id)
             if transcript:
                 text = transcript
-                send_telegram_text(f"🎤 Verstanden:\n<i>{transcript}</i>")
+                verstanden_id = send_telegram_text(f"🎤 Verstanden:\n<i>{transcript}</i>")
+                # Voice-Message + Bot-Antworten zum aktiven Edit-Vorgang tracken
+                for _token, _p in pending.items():
+                    if _p.get("awaiting_edit"):
+                        if "edit_msg_ids" not in _p:
+                            _p["edit_msg_ids"] = []
+                        if msg_id:
+                            _p["edit_msg_ids"].append(msg_id)  # User Voice-Message
+                        if hoere_zu_id:
+                            _p["edit_msg_ids"].append(hoere_zu_id)
+                        if verstanden_id:
+                            _p["edit_msg_ids"].append(verstanden_id)
+                        break
             else:
                 send_telegram_text("⚠️ Sprachnachricht konnte nicht erkannt werden. Bitte nochmal versuchen oder als Text schreiben.")
                 return
@@ -1949,6 +1995,12 @@ def handle_telegram_update(update):
 
         for token, p in list(pending.items()):
             if p.get("awaiting_edit"):
+                # User-Nachricht (Text) zum Edit-Vorgang tracken
+                if "edit_msg_ids" not in p:
+                    p["edit_msg_ids"] = []
+                if msg_id:
+                    p["edit_msg_ids"].append(msg_id)
+
                 lines    = p["draft"].split("\n")
                 old_body = "\n".join(l for l in lines if not l.startswith("BETREFF:")).strip()
 
@@ -1988,8 +2040,10 @@ def handle_telegram_update(update):
                     translation_draft = translate_to_german(draft_text, "Antwort-Entwurf")
                     pending[token]["translation_draft"] = translation_draft
 
-                # Alte Telegram-Nachrichten loeschen
+                # Alte Telegram-Nachrichten + Edit-Zwischen-Nachrichten loeschen
                 delete_telegram_messages(p.get("telegram_msg_ids", []))
+                delete_telegram_messages(p.get("edit_msg_ids", []))
+                pending[token]["edit_msg_ids"] = []
 
                 new_tg_ids = send_approval_request(
                     token, p["sender"], p["subject"], p["body"],
