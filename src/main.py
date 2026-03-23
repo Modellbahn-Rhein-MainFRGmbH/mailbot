@@ -1650,11 +1650,13 @@ def transcribe_voice_message(file_id):
         )
         if r.status_code != 200:
             log.error(f"Telegram getFile Fehler: {r.status_code}")
+            send_telegram_text(f"⚠️ Telegram File-Info Fehler: {r.status_code}")
             return None
 
         file_path = r.json().get("result", {}).get("file_path", "")
         if not file_path:
             log.error("Telegram getFile: Kein file_path")
+            send_telegram_text("⚠️ Telegram hat keinen Dateipfad zurückgegeben.")
             return None
 
         # Schritt 2: Datei herunterladen
@@ -1664,6 +1666,7 @@ def transcribe_voice_message(file_id):
         )
         if file_r.status_code != 200:
             log.error(f"Telegram File-Download Fehler: {file_r.status_code}")
+            send_telegram_text(f"⚠️ Audio-Download Fehler: {file_r.status_code}")
             return None
 
         audio_data = file_r.content
@@ -1674,28 +1677,53 @@ def transcribe_voice_message(file_id):
         ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "ogg"
         filename = f"voice.{ext}"
 
-        groq_r = requests.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": (filename, audio_data, "audio/ogg")},
-            data={
-                "model": "whisper-large-v3",
-                "language": "de",
-                "response_format": "text"
-            },
-            timeout=30
-        )
+        # Beide Modelle probieren (whisper-large-v3-turbo ist schneller)
+        models = ["whisper-large-v3-turbo", "whisper-large-v3"]
 
-        if groq_r.status_code == 200:
-            transcript = groq_r.text.strip()
-            log.info(f"Sprachnachricht transkribiert: {transcript[:100]}")
-            return transcript
-        else:
-            log.error(f"Groq Whisper Fehler {groq_r.status_code}: {groq_r.text[:200]}")
-            return None
+        for model in models:
+            log.info(f"Versuche Groq Modell: {model}")
+            groq_r = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": (filename, audio_data, "audio/ogg")},
+                data={
+                    "model": model,
+                    "language": "de",
+                    "response_format": "text"
+                },
+                timeout=30
+            )
+
+            if groq_r.status_code == 200:
+                transcript = groq_r.text.strip()
+                if transcript:
+                    log.info(f"Sprachnachricht transkribiert ({model}): {transcript[:100]}")
+                    return transcript
+                else:
+                    log.warning(f"Groq {model}: Leere Antwort")
+                    continue
+            else:
+                error_text = groq_r.text[:300]
+                log.error(f"Groq {model} Fehler {groq_r.status_code}: {error_text}")
+                # Beim ersten Modell: nochmal mit dem anderen versuchen
+                if model == models[0]:
+                    log.info("Versuche Fallback-Modell...")
+                    continue
+                else:
+                    # Beide Modelle fehlgeschlagen - Fehler in Telegram zeigen
+                    send_telegram_text(
+                        f"⚠️ Groq Whisper Fehler ({groq_r.status_code}):\n"
+                        f"<code>{error_text[:200]}</code>"
+                    )
+                    return None
+
+        # Kein Modell hat funktioniert
+        send_telegram_text("⚠️ Spracherkennung fehlgeschlagen bei allen Modellen.")
+        return None
 
     except Exception as e:
         log.error(f"Voice-Transkription: {e}")
+        send_telegram_text(f"⚠️ Voice-Fehler: {str(e)[:200]}")
         return None
 
 
