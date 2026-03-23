@@ -893,13 +893,15 @@ def fetch_woocommerce_order(sender_email):
 
 
 def fetch_sendcloud_tracking(order_data, extra_search=None):
-    """Sendcloud Tracking abrufen. Sucht nach order_id, oder extra_search als Fallback."""
+    """Sendcloud Tracking abrufen. Verifiziert dass das Paket zur Bestellung gehoert."""
     if not SC_KEY:
         return None
 
     search_terms = []
+    order_id_str = ""
     if order_data and order_data.get("order_id"):
-        search_terms.append(str(order_data["order_id"]))
+        order_id_str = str(order_data["order_id"])
+        search_terms.append(order_id_str)
     if extra_search:
         search_terms.append(str(extra_search))
 
@@ -915,16 +917,49 @@ def fetch_sendcloud_tracking(order_data, extra_search=None):
                 timeout=15
             )
             parcels = r.json().get("parcels", [])
-            if parcels:
-                p = parcels[0]
-                result = {
-                    "tracking_number": p.get("tracking_number"),
-                    "status": p.get("status", {}).get("message", ""),
-                    "carrier": p.get("carrier", {}).get("code", ""),
-                    "tracking_url": p.get("tracking_url", "")
-                }
-                log.info(f"Sendcloud Tracking gefunden (Suche: {search}): {result['carrier']} {result['tracking_number']} - {result['status']}")
-                return result
+            if not parcels:
+                continue
+
+            # WICHTIG: Verifiziere dass das Paket wirklich zur Bestellung gehoert
+            # Sendcloud search ist fuzzy und kann falsche Ergebnisse liefern
+            matched_parcel = None
+            for p in parcels:
+                parcel_order_nr = str(p.get("order_number", ""))
+                parcel_ext_order = str(p.get("external_order_id", ""))
+                parcel_ext_ref = str(p.get("external_reference", ""))
+
+                # Exakter Match auf Bestellnummer pruefen
+                if order_id_str and (
+                    parcel_order_nr == order_id_str or
+                    parcel_ext_order == order_id_str or
+                    parcel_ext_ref == order_id_str
+                ):
+                    matched_parcel = p
+                    log.info(f"Sendcloud: Exakter Match fuer Bestellung #{order_id_str}")
+                    break
+                # Auch gegen extra_search pruefen (z.B. Rechnungsnummer)
+                if extra_search and (
+                    parcel_order_nr == str(extra_search) or
+                    parcel_ext_order == str(extra_search) or
+                    parcel_ext_ref == str(extra_search)
+                ):
+                    matched_parcel = p
+                    log.info(f"Sendcloud: Match ueber Suchbegriff {extra_search}")
+                    break
+
+            if not matched_parcel:
+                log.warning(f"Sendcloud: {len(parcels)} Paket(e) gefunden fuer '{search}', aber keins gehoert zu Bestellung #{order_id_str}. Verworfen.")
+                continue
+
+            result = {
+                "tracking_number": matched_parcel.get("tracking_number"),
+                "status": matched_parcel.get("status", {}).get("message", ""),
+                "carrier": matched_parcel.get("carrier", {}).get("code", ""),
+                "tracking_url": matched_parcel.get("tracking_url", "")
+            }
+            log.info(f"Sendcloud Tracking verifiziert (Bestellung #{order_id_str}): {result['carrier']} {result['tracking_number']} - {result['status']}")
+            return result
+
         except Exception as e:
             log.warning(f"Sendcloud: {e}")
 
@@ -938,6 +973,17 @@ def build_context(sender_email, order_data, tracking_data, product_data=None):
         lines.append(f"Status: {order_data['status']} | Datum: {order_data['date']} | Betrag: {order_data['total']} EUR")
         if order_data.get("payment_method"):
             lines.append(f"Bezahlung: {order_data['payment_method']}")
+        # Klare Zahlungsstatus-Interpretation fuer Claude
+        status = order_data.get("status", "")
+        payment = order_data.get("payment_method", "")
+        if status == "Wartend" and "Vorkasse" in payment:
+            lines.append("ACHTUNG: Zahlung noch NICHT eingegangen! Bestellung wartet auf Bankueberweisung.")
+        elif status == "Wartend":
+            lines.append("ACHTUNG: Bestellung wartet noch auf Zahlungseingang.")
+        elif status == "In Bearbeitung":
+            lines.append("Zahlung eingegangen, Bestellung wird bearbeitet/versendet.")
+        elif status == "Abgeschlossen":
+            lines.append("Bestellung abgeschlossen und versendet.")
         if order_data.get("shipping_city"):
             lines.append(f"Versand nach: {order_data['shipping_city']}")
         if order_data.get("customer_note"):
@@ -951,6 +997,8 @@ def build_context(sender_email, order_data, tracking_data, product_data=None):
         lines.append(f"Paketstatus: {tracking_data['status']}")
         if tracking_data.get("tracking_url"):
             lines.append(f"Tracking: {tracking_data['tracking_url']}")
+    elif order_data:
+        lines.append("Sendungsverfolgung: Kein Tracking vorhanden (Bestellung wurde noch nicht versendet)")
     if product_data:
         lines.append("\nARTIKEL-INFORMATIONEN:")
         for prod in product_data:
@@ -1673,9 +1721,9 @@ def transcribe_voice_message(file_id):
         log.info(f"Voice Message heruntergeladen: {len(audio_data)} Bytes ({file_path})")
 
         # Schritt 3: An Groq Whisper API senden
-        # Dateiendung aus Telegram-Pfad ermitteln (meist .oga oder .ogg)
-        ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "ogg"
-        filename = f"voice.{ext}"
+        # Telegram sendet Voice als .oga - Groq akzeptiert das nicht
+        # .oga ist technisch OGG/Opus, daher als .ogg senden
+        filename = "voice.ogg"
 
         # Beide Modelle probieren (whisper-large-v3-turbo ist schneller)
         models = ["whisper-large-v3-turbo", "whisper-large-v3"]
