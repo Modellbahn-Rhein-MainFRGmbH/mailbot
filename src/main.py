@@ -2015,7 +2015,17 @@ def handle_telegram_update(update):
         if text == "/stats" or text == "/stats@ModellbahnAssistentBot":
             reset_daily_stats_if_needed()
             send_daily_summary()
-            return
+            return if text == "/feedback" or text == "/feedback@ModellbahnAssistentBot":
+              try:
+                  fb = load_feedback()
+                  if fb:
+                      fb_text = json.dumps(fb, ensure_ascii=False, indent=2)
+                      send_telegram_document(fb_text, "feedback_history.json", f"📊 {len(fb)} Korrekturen")
+                  else:
+                      send_telegram_text("Keine Feedback-Daten vorhanden.")
+              except Exception as e:
+                  send_telegram_text(f"⚠️ Fehler: {e}")
+              return
 
         if text.startswith("/"):
             return
