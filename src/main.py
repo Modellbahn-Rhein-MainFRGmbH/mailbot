@@ -205,7 +205,7 @@ SAMMLUNG VERKAUFEN / ANKAUF:
   Fabian bewertet jedes Modell individuell anhand seiner eigenen Datenbank.
   Stattdessen immer schreiben: "Ich schaue mir die Wagen/Modelle an und nenne Ihnen dann den Ankaufspreis."
   oder: "Den genauen Ankaufspreis kann ich Ihnen nennen sobald ich die Modelle gesehen habe."
-  Bei bekannten laufenden Verhandlungen (z.B. im Mail-Verlauf steht schon ein Preis von Fabian): 
+  Bei bekannten laufenden Verhandlungen (z.B. im Mail-Verlauf steht schon ein Preis von Fabian):
   Auf Fabians genannten Preis verweisen, aber KEINE neuen Preise fuer weitere Modelle erfinden.
 
 KOMMENDE SAMMLUNGEN:
@@ -287,7 +287,7 @@ Antwort: Hallo Herr Baierl, auf unseren Artikelfotos war die Haltestange noch vo
 
 BEISPIEL 3 - Technische Rueckfrage international (Englisch):
 Kunde: "Lack-Overspray auf dem Dach? Gehaeuse beschaedigt? Versand in die USA moeglich?"
-Antwort: Hallo Eric, ja, das Modell wurde nachlackiert, was man am Uebergang zum Dach sieht. Das Gehaeuse hat keine Spruenge. Wir versenden regelmaessig und gerne in die USA!
+Antwort: Hallo Eric, ja, das Modell wurde nacklackiert, was man am Uebergang zum Dach sieht. Das Gehaeuse hat keine Spruenge. Wir versenden regelmaessig und gerne in die USA!
 
 BEISPIEL 4 - Nachverhandlung / Kulanz:
 Kunde: "Wieder da nach Krankheit. Vielleicht 10 EUR Nachlass fuer Decals?"
@@ -2015,17 +2015,19 @@ def handle_telegram_update(update):
         if text == "/stats" or text == "/stats@ModellbahnAssistentBot":
             reset_daily_stats_if_needed()
             send_daily_summary()
-            return if text == "/feedback" or text == "/feedback@ModellbahnAssistentBot":
-              try:
-                  fb = load_feedback()
-                  if fb:
-                      fb_text = json.dumps(fb, ensure_ascii=False, indent=2)
-                      send_telegram_document(fb_text, "feedback_history.json", f"📊 {len(fb)} Korrekturen")
-                  else:
-                      send_telegram_text("Keine Feedback-Daten vorhanden.")
-              except Exception as e:
-                  send_telegram_text(f"⚠️ Fehler: {e}")
-              return
+            return
+
+        if text == "/feedback" or text == "/feedback@ModellbahnAssistentBot":
+            try:
+                fb = load_feedback()
+                if fb:
+                    fb_text = json.dumps(fb, ensure_ascii=False, indent=2)
+                    send_telegram_document(fb_text, "feedback_history.json", f"📊 {len(fb)} Korrekturen")
+                else:
+                    send_telegram_text("Keine Feedback-Daten vorhanden.")
+            except Exception as e:
+                send_telegram_text(f"⚠️ Fehler: {e}")
+            return
 
         if text.startswith("/"):
             return
@@ -2725,25 +2727,29 @@ def main():
     ebay_timer = 0
     summary_sent_today = False
     while True:
-        updates = get_telegram_updates(offset)
-        for upd in updates:
-            handle_telegram_update(upd)
-            offset = upd["update_id"] + 1
-        if time.time() - mail_timer > 120:
-            check_inbox()
-            mail_timer = time.time()
-        # eBay alle 3 Minuten pruefen (wenn API aktiv)
-        if EBAY_ENABLED and time.time() - ebay_timer > 180:
-            ebay_check_messages()
-            ebay_timer = time.time()
-        # Tages-Zusammenfassung um 20:00 senden
-        current_hour = datetime.now().hour
-        if current_hour == 20 and not summary_sent_today:
-            send_daily_summary()
-            summary_sent_today = True
-        elif current_hour != 20:
-            summary_sent_today = False
-        time.sleep(2)
+        try:
+            updates = get_telegram_updates(offset)
+            for upd in updates:
+                handle_telegram_update(upd)
+                offset = upd["update_id"] + 1
+            if time.time() - mail_timer > 120:
+                check_inbox()
+                mail_timer = time.time()
+            # eBay alle 3 Minuten pruefen (wenn API aktiv)
+            if EBAY_ENABLED and time.time() - ebay_timer > 180:
+                ebay_check_messages()
+                ebay_timer = time.time()
+            # Tages-Zusammenfassung um 20:00 senden
+            current_hour = datetime.now().hour
+            if current_hour == 20 and not summary_sent_today:
+                send_daily_summary()
+                summary_sent_today = True
+            elif current_hour != 20:
+                summary_sent_today = False
+            time.sleep(2)
+        except Exception as e:
+            log.error(f"Main loop error: {e}")
+            time.sleep(10)
 
 
 if __name__ == "__main__":
