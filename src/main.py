@@ -52,6 +52,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 # Feedback-Datei (Railway Volume oder lokaler Pfad)
 FEEDBACK_DIR  = os.environ.get("FEEDBACK_DIR", "/data")
 FEEDBACK_FILE = os.path.join(FEEDBACK_DIR, "feedback_history.json")
+TODO_FILE = os.path.join(FEEDBACK_DIR, "todos.json")
 
 client  = Anthropic(api_key=ANTHROPIC_KEY)
 pending = {}
@@ -106,6 +107,242 @@ def build_feedback_prompt():
         lines.append(f"  Korrigierte Version: {fb.get('corrected_draft', '')[:150]}")
     lines.append("\nNutze diese Korrekturen um Fabians Stil und Vorlieben besser zu treffen.")
     return "\n".join(lines)
+
+
+# ============================================================
+# TO-DO SYSTEM: Aufgaben aus Mail-Antworten erkennen + manuell anlegen
+# ============================================================
+
+def load_todos():
+    """Lade alle To-Dos aus JSON-Datei."""
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+        if os.path.exists(TODO_FILE):
+            with open(TODO_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"Todos laden: {e}")
+    return []
+
+
+def save_todos(todos):
+    """Speichere To-Do-Liste in JSON-Datei."""
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+        with open(TODO_FILE, "w", encoding="utf-8") as f:
+            json.dump(todos, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Todos speichern: {e}")
+
+
+def add_todo(text, due_date=None, due_time=None, source="manual", customer="", order_id=None):
+    """Neues To-Do anlegen."""
+    from datetime import timedelta
+    todos = load_todos()
+    max_id = max((t.get("id", 0) for t in todos), default=0)
+    todo = {
+        "id": max_id + 1,
+        "text": text,
+        "due_date": due_date or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
+        "due_time": due_time or "09:00",
+        "source": source,
+        "customer": customer,
+        "order_id": order_id,
+        "done": False,
+        "created_at": datetime.now().isoformat(),
+        "done_at": None
+    }
+    todos.append(todo)
+    save_todos(todos)
+    log.info(f"Todo #{todo['id']} angelegt: {text} (faellig: {todo['due_date']} {todo['due_time']})")
+    return todo
+
+
+def complete_todo(todo_id):
+    """To-Do als erledigt markieren."""
+    todos = load_todos()
+    for t in todos:
+        if t["id"] == todo_id and not t["done"]:
+            t["done"] = True
+            t["done_at"] = datetime.now().isoformat()
+            save_todos(todos)
+            log.info(f"Todo #{todo_id} erledigt: {t['text']}")
+            return t
+    return None
+
+
+def get_open_todos():
+    """Alle offenen To-Dos, sortiert nach Faelligkeitsdatum."""
+    todos = load_todos()
+    open_todos = [t for t in todos if not t["done"]]
+    open_todos.sort(key=lambda t: f"{t.get('due_date', '9999')}{t.get('due_time', '99:99')}")
+    return open_todos
+
+
+def get_due_todos():
+    """To-Dos die heute oder frueher faellig sind."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return [t for t in get_open_todos() if t.get("due_date", "9999") <= today]
+
+
+def cleanup_old_todos():
+    """Erledigte To-Dos die aelter als 30 Tage sind entfernen."""
+    from datetime import timedelta
+    todos = load_todos()
+    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    cleaned = [t for t in todos if not t["done"] or (t.get("done_at", "") > cutoff)]
+    if len(cleaned) < len(todos):
+        log.info(f"Todos aufgeraeumt: {len(todos) - len(cleaned)} alte erledigte entfernt")
+        save_todos(cleaned)
+
+
+def extract_todo_from_draft(draft_text, category, customer_name, order_id=None):
+    """Lasse Claude pruefen ob in der Antwort eine implizite Aufgabe steckt."""
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{"role": "user", "content": (
+                f"AKTUELLES DATUM: {datetime.now().strftime('%Y-%m-%d')} ({['Montag','Dienstag','Mittwoch','Donnerstag','Freitag','Samstag','Sonntag'][datetime.now().weekday()]})\n\n"
+                f"Analysiere diese Mail-Antwort eines Haendlers an einen Kunden.\n"
+                f"Enthaelt die Antwort ein VERSPRECHEN oder eine ZUSAGE die der Haendler noch erledigen muss?\n\n"
+                f"Beispiele fuer Aufgaben:\n"
+                f"- 'morgen wird Ihre Retoure bearbeitet' -> Aufgabe: Retoure bearbeiten\n"
+                f"- 'ich schaue morgen im Lager nach' -> Aufgabe: Im Lager nachschauen\n"
+                f"- 'die Erstattung veranlasse ich heute' -> Aufgabe: Erstattung veranlassen\n"
+                f"- 'wir senden den korrekten Artikel nach' -> Aufgabe: Artikel nachsenden\n"
+                f"- 'ich melde mich dann bei Ihnen' -> Aufgabe: Kunde kontaktieren\n\n"
+                f"Beispiele die KEINE Aufgabe sind:\n"
+                f"- 'das Paket ist unterwegs' (schon erledigt)\n"
+                f"- 'die Stornierung ist durchgefuehrt' (schon erledigt)\n"
+                f"- 'kein Problem' (keine Aktion noetig)\n"
+                f"- 'Sie koennen den Artikel zurueckschicken' (Kunde muss handeln, nicht wir)\n\n"
+                f"Kategorie: {category}\n"
+                f"Kunde: {customer_name}\n"
+                f"Antwort:\n{draft_text}\n\n"
+                f"Wenn eine Aufgabe erkannt wird, antworte im EXAKTEN Format:\n"
+                f"TODO|Aufgabentext|YYYY-MM-DD|HH:MM\n"
+                f"Berechne das Datum aus dem Kontext ('morgen' = naechster Tag, 'diese Woche' = Freitag).\n"
+                f"Wenn KEINE Aufgabe erkannt wird, antworte NUR: NONE"
+            )}]
+        )
+        result = resp.content[0].text.strip()
+        if result.startswith("TODO|"):
+            parts = result.split("|")
+            if len(parts) >= 3:
+                task_text = parts[1].strip()
+                due_date = parts[2].strip()
+                due_time = parts[3].strip() if len(parts) > 3 else "09:00"
+                if customer_name and customer_name not in task_text:
+                    task_text = f"{task_text} ({customer_name})"
+                return {"text": task_text, "due_date": due_date, "due_time": due_time}
+        return None
+    except Exception as e:
+        log.warning(f"Todo-Extraktion: {e}")
+        return None
+
+
+def parse_todo_command(text):
+    """Parse /todo Befehl mit optionalem Datum/Uhrzeit."""
+    import re
+    from datetime import timedelta
+
+    content = text.replace("/todo@ModellbahnAssistentBot", "").replace("/todo", "").strip()
+    if not content:
+        return None
+
+    today = datetime.now()
+    due_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    due_time = "09:00"
+
+    # Explizites Datum: 2026-04-10
+    date_match = re.match(r'(\d{4}-\d{2}-\d{2})\s*(.*)', content)
+    if date_match:
+        due_date = date_match.group(1)
+        content = date_match.group(2).strip()
+    elif content.lower().startswith("heute"):
+        due_date = today.strftime("%Y-%m-%d")
+        content = content[5:].strip()
+    elif content.lower().startswith("morgen"):
+        due_date = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+        content = content[6:].strip()
+    elif content.lower().startswith("übermorgen") or content.lower().startswith("uebermorgen"):
+        due_date = (today + timedelta(days=2)).strftime("%Y-%m-%d")
+        content = re.sub(r'^(?:übermorgen|uebermorgen)', '', content, flags=re.IGNORECASE).strip()
+    else:
+        # Wochentage
+        weekdays = {"montag": 0, "dienstag": 1, "mittwoch": 2, "donnerstag": 3, "freitag": 4, "samstag": 5, "sonntag": 6}
+        for name, day_num in weekdays.items():
+            if content.lower().startswith(name):
+                days_ahead = (day_num - today.weekday()) % 7 or 7
+                due_date = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+                content = content[len(name):].strip()
+                break
+
+    # Uhrzeit (HH:MM)
+    time_match = re.match(r'(\d{1,2}:\d{2})\s*(.*)', content)
+    if time_match:
+        due_time = time_match.group(1)
+        if len(due_time) == 4:
+            due_time = "0" + due_time
+        content = time_match.group(2).strip()
+
+    if not content:
+        return None
+
+    return {"text": content, "due_date": due_date, "due_time": due_time}
+
+
+def format_todo_list(todos, title="📋 Offene To-Dos"):
+    """Formatiere To-Do-Liste fuer Telegram."""
+    if not todos:
+        return f"{title}\n\nKeine offenen To-Dos! 🎉"
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = [f"<b>{title}</b>\n"]
+    for t in todos:
+        due = t.get("due_date", "")
+        due_time = t.get("due_time", "")
+        if due < today:
+            emoji = "🔴"
+        elif due == today:
+            emoji = "🟡"
+        else:
+            emoji = "⚪"
+        try:
+            date_obj = datetime.strptime(due, "%Y-%m-%d")
+            weekday = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"][date_obj.weekday()]
+            date_str = f"{weekday} {date_obj.strftime('%d.%m.')}"
+        except:
+            date_str = due
+        source_icon = "📧" if t.get("source") == "mail" else "✋"
+        lines.append(f"{emoji} <b>#{t['id']}</b> {t['text']}\n   📅 {date_str} {due_time} {source_icon}")
+    lines.append(f"\n✅ Erledigen: <code>/done ID</code>")
+    return "\n".join(lines)
+
+
+def send_todo_reminder():
+    """Sende Erinnerung fuer faellige To-Dos per Telegram."""
+    due_todos = get_due_todos()
+    if not due_todos:
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    overdue = [t for t in due_todos if t.get("due_date", "") < today]
+    today_todos = [t for t in due_todos if t.get("due_date", "") == today]
+    msg_parts = ["⏰ <b>To-Do Erinnerung</b>\n"]
+    if overdue:
+        msg_parts.append(f"🔴 <b>{len(overdue)} überfällig:</b>")
+        for t in overdue:
+            msg_parts.append(f"  • #{t['id']} {t['text']}")
+        msg_parts.append("")
+    if today_todos:
+        msg_parts.append(f"🟡 <b>{len(today_todos)} heute fällig:</b>")
+        for t in today_todos:
+            msg_parts.append(f"  • #{t['id']} {t['text']} ({t.get('due_time', '')})")
+        msg_parts.append("")
+    msg_parts.append(f"✅ Erledigen: <code>/done ID</code>")
+    send_telegram_text("\n".join(msg_parts))
+    log.info(f"Todo-Erinnerung: {len(overdue)} ueberfaellig, {len(today_todos)} heute")
 
 
 SIGNATURE = """Beste Grüße,
@@ -1896,6 +2133,29 @@ def handle_telegram_update(update):
                 else:
                     daily_stats["shop_answered"] += 1
 
+                # To-Do aus Antwort extrahieren
+                draft_body = "\n".join(l for l in p.get("draft", "").split("\n") if not l.startswith("BETREFF:")).strip()
+                extracted_todo = extract_todo_from_draft(
+                    draft_body, p.get("category", ""), p.get("sender", ""), p.get("order_id")
+                )
+                if extracted_todo:
+                    todo = add_todo(
+                        extracted_todo["text"], due_date=extracted_todo["due_date"],
+                        due_time=extracted_todo["due_time"], source="mail",
+                        customer=p.get("sender", ""), order_id=p.get("order_id")
+                    )
+                    try:
+                        date_obj = datetime.strptime(todo["due_date"], "%Y-%m-%d")
+                        weekday = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"][date_obj.weekday()]
+                        date_str = f"{weekday} {date_obj.strftime('%d.%m.%Y')}"
+                    except:
+                        date_str = todo["due_date"]
+                    send_telegram_text(
+                        f"📌 To-Do erkannt:\n"
+                        f"<b>#{todo['id']}</b> {todo['text']}\n"
+                        f"📅 {date_str} {todo['due_time']}"
+                    )
+
                 # Termin erkennen und ICS-Datei + Google Calendar Link senden
                 termin = extract_termin_from_draft(p.get("draft", ""))
                 if termin:
@@ -2007,9 +2267,12 @@ def handle_telegram_update(update):
             pending_count = len(pending)
             ebay_status = "aktiv" if EBAY_ENABLED else "nicht konfiguriert"
             voice_status = "aktiv" if GROQ_API_KEY else "nicht konfiguriert (GROQ_API_KEY fehlt)"
+            open_todos = len(get_open_todos())
+            due_todos = len(get_due_todos())
             status_msg = (
                 f"📊 <b>Bot-Status</b>\n"
                 f"Offene Vorgaenge: {pending_count}\n"
+                f"📌 To-Dos: {open_todos} offen, {due_todos} faellig\n"
                 f"Korrekturen im Archiv: {fb_count}\n"
                 f"eBay API: {ebay_status}\n"
                 f"eBay verarbeitet: {len(ebay_processed_ids)} Nachrichten\n"
@@ -2033,6 +2296,53 @@ def handle_telegram_update(update):
                     send_telegram_text("Keine Feedback-Daten vorhanden.")
             except Exception as e:
                 send_telegram_text(f"⚠️ Fehler: {e}")
+            return
+
+        if text == "/todos" or text == "/todos@ModellbahnAssistentBot":
+            todos = get_open_todos()
+            msg = format_todo_list(todos)
+            send_telegram_text(msg)
+            return
+
+        if text.startswith("/done") and not text.startswith("/done@ModellbahnAssistentBot"):
+            try:
+                todo_id = int(text.replace("/done", "").strip())
+                result = complete_todo(todo_id)
+                if result:
+                    send_telegram_text(f"✅ Erledigt: {result['text']}")
+                else:
+                    send_telegram_text(f"⚠️ To-Do #{todo_id} nicht gefunden oder bereits erledigt.")
+            except ValueError:
+                send_telegram_text("⚠️ Bitte eine To-Do-ID angeben: <code>/done 1</code>")
+            return
+
+        if text == "/done@ModellbahnAssistentBot" or text == "/done":
+            send_telegram_text("⚠️ Bitte eine To-Do-ID angeben: <code>/done 1</code>")
+            return
+
+        if text.startswith("/todo") and not text.startswith("/todos"):
+            parsed = parse_todo_command(text)
+            if parsed:
+                todo = add_todo(parsed["text"], due_date=parsed["due_date"], due_time=parsed["due_time"], source="manual")
+                try:
+                    date_obj = datetime.strptime(todo["due_date"], "%Y-%m-%d")
+                    weekday = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"][date_obj.weekday()]
+                    date_str = f"{weekday} {date_obj.strftime('%d.%m.%Y')}"
+                except:
+                    date_str = todo["due_date"]
+                send_telegram_text(
+                    f"📌 To-Do #{todo['id']} angelegt:\n"
+                    f"{todo['text']}\n"
+                    f"📅 {date_str} {todo['due_time']}"
+                )
+            else:
+                send_telegram_text(
+                    "📌 <b>To-Do anlegen:</b>\n\n"
+                    "<code>/todo Retoure Mueller bearbeiten</code>\n"
+                    "<code>/todo morgen Erstattung veranlassen</code>\n"
+                    "<code>/todo 2026-04-15 14:00 Termin Herr Schmidt</code>\n"
+                    "<code>/todo freitag Lager aufraemen</code>"
+                )
             return
 
         if text.startswith("/"):
@@ -2719,19 +3029,23 @@ def main():
     ebay_info = "✅ eBay API aktiv" if EBAY_ENABLED else "⏳ eBay API noch nicht konfiguriert"
     voice_info = "✅ Sprachnachrichten aktiv" if GROQ_API_KEY else "⏳ Sprachnachrichten nicht konfiguriert (GROQ_API_KEY)"
 
+    todo_count = len(get_open_todos())
+    todo_info = f"\n📌 {todo_count} offene To-Dos" if todo_count > 0 else ""
+
     send_telegram_text(
         f"🚂 <b>Modellbahn Mail Assistent v6 gestartet!</b>\n"
         f"Ich ueberwache dein Postfach und eBay.\n\n"
         f"📂 Feine Kategorien (Lieferstatus, Retoure, Beschwerde, ...)\n"
         f"🧠 Lerne aus deinen Korrekturen\n"
-        f"📦 Bessere Bestelldaten aus WooCommerce\n"
+        f"📌 To-Do-System (/todo, /todos, /done)\n"
         f"🏪 {ebay_info}\n"
-        f"🎤 {voice_info}{fb_info}"
+        f"🎤 {voice_info}{fb_info}{todo_info}"
     )
     offset     = 0
     mail_timer = 0
     ebay_timer = 0
     summary_sent_today = False
+    todo_reminder_sent_today = False
     while True:
         try:
             updates = get_telegram_updates(offset)
@@ -2745,8 +3059,16 @@ def main():
             if EBAY_ENABLED and time.time() - ebay_timer > 180:
                 ebay_check_messages()
                 ebay_timer = time.time()
-            # Tages-Zusammenfassung um 20:00 senden
+            # To-Do Erinnerung um 8:30 senden
             current_hour = datetime.now().hour
+            current_minute = datetime.now().minute
+            if current_hour == 8 and current_minute >= 30 and not todo_reminder_sent_today:
+                send_todo_reminder()
+                cleanup_old_todos()
+                todo_reminder_sent_today = True
+            elif current_hour != 8:
+                todo_reminder_sent_today = False
+            # Tages-Zusammenfassung um 20:00 senden
             if current_hour == 20 and not summary_sent_today:
                 send_daily_summary()
                 summary_sent_today = True
